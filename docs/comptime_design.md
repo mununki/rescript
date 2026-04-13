@@ -303,11 +303,33 @@ The first version is intentionally limited.
 - no new call-site syntax for selecting target types
 - no unrestricted compile-time module execution
 
+## Comparison with Zig
+
+This design is inspired by Zig's `comptime`, but it is not trying to match Zig's
+full execution model in v1.
+
+- Zig `comptime` is a broader compile-time execution model. Ordinary Zig code can
+  often run at compile time as long as the language semantics allow it.
+- The current ReScript design is more explicit and more staged. `%comptime(...)`
+  marks the compile-time boundary, and `%quote(...)` / `%splice(...)` are used to
+  construct and combine generated code.
+- Zig leans more on compile-time evaluation plus reflection such as `@typeInfo`
+  and `inline for`. The current ReScript design leans more on typed generators
+  that return code values.
+- This makes the ReScript v1 design narrower than Zig, but also easier to fit
+  into the existing compiler without redesigning the whole language around
+  compile-time execution.
+
 ## Future Directions
 
 Natural next steps include:
 
+- broader pure compile-time evaluation so more ordinary ReScript helper code can
+  run during `%comptime(...)`
 - richer type reflection
 - a more complete code builder surface
+- less reliance on explicit helper scaffolding as the evaluation and reflection
+  model becomes more capable
 - support for nested, generic, and variant-driven generators
+- support for more call sites than top-level annotated bindings
 - package-distributed compile-time libraries
