@@ -10,6 +10,15 @@ The user surface is intentionally small:
   - `field.name`
   - `field.typ`
   - `field.get(value)`
+- reflected tuple item accessors
+  - `item.index`
+  - `item.typ`
+  - `item.get(value)`
+- reflected constructor accessors
+  - `constructor.name`
+  - `constructor.payload`
+  - `constructor.unpack(value)`
+  - `constructor.make(payload)`
 
 ## Design Goals
 
@@ -63,14 +72,22 @@ The descriptor space is intentionally small:
 - `Bool`
 - `Option(desc)`
 - `Array(desc)`
+- `List(desc)`
 - `Record({name, fields})`
+- `Tuple({items})`
+- `Variant({name, constructors})`
 
 Current reflection target support:
 
 - same-module named records
+- same-module named ordinary variants
+- built-in `list`
+- built-in `result`
 - no generics
-- no variants
-- no recursive types
+- no inline-record constructors
+- no polymorphic variants
+- no open/extensible variants
+- no arbitrary recursive user-defined types
 - no cross-module reflection
 
 Each reflected record field exposes:
@@ -81,6 +98,25 @@ Each reflected record field exposes:
 
 `field.get(value)` means “generate a field access on the runtime value `value`”.
 
+Each reflected tuple item exposes:
+
+- `item.index`
+- `item.typ`
+- `item.get(value)`
+
+Each reflected constructor exposes:
+
+- `constructor.name`
+- `constructor.payload`
+- `constructor.unpack(value)`
+- `constructor.make(payload)`
+
+`constructor.payload` is one of:
+
+- `NoPayload`
+- `Single(desc)`
+- `Tuple({items})`
+
 ## Compile-Time Evaluation Model
 
 The current implementation uses a typed comptime phase after the first
@@ -89,7 +125,7 @@ typecheck. The important semantic point is:
 - control flow over reflected data runs at compile time
 - ordinary runtime syntax returned from `%comptime(...)` remains runtime code
 
-Supported in the current PoC:
+Supported in the current implementation:
 
 - literals
 - same-module helper calls
@@ -121,114 +157,67 @@ For JSON encoding:
 ```rescript
 open Comptime
 
-type user = {
-  name: string,
-  age: int,
-  active: bool,
-}
-
 let makeJsonEncoder: type t. unit => t => JSON.t = () => {
-  switch reflect() {
-  | Record({fields}) =>
-    let encodeField = (field, value) =>
-      switch field.typ {
-      | String => JSON.String(field.get(value))
-      | Int => JSON.Number(Int.toFloat(field.get(value)))
-      | Bool => JSON.Boolean(field.get(value))
-      | _ => failwith("makeJsonEncoder only supports string, int, and bool fields")
+  let rec encodeByType: type a. (typeDesc<a>, a) => JSON.t = (desc, value) =>
+    switch desc {
+    | String => JSON.String(value)
+    | Int => JSON.Number(Int.toFloat(value))
+    | Float => JSON.Number(value)
+    | Bool => JSON.Boolean(value)
+    | Json => value
+    | Option(inner) =>
+      switch value {
+      | Some(value) => encodeByType(inner, value)
+      | None => JSON.Null
       }
-
-    (value: t) => {
-      let builder =
+    | Array(inner) => JSON.Array(value->Array.map(item => encodeByType(inner, item)))
+    | List(inner) =>
+      JSON.Array(value->List.toArray->Array.map(item => encodeByType(inner, item)))
+    | Record({fields}) =>
+      JSON.Object(
         fields->Array.reduce(Dict.make(), (builder, field) => {
           let nextBuilder = Dict.copy(builder)
-          Dict.set(nextBuilder, field.name, encodeField(field, value))
+          Dict.set(nextBuilder, field.name, encodeByType(field.typ, field.get(value)))
           nextBuilder
-        })
-
-      JSON.Object(builder)
+        }),
+      )
+    | Tuple({items}) =>
+      JSON.Array(items->Array.map(item => encodeByType(item.typ, item.get(value))))
+    | Variant({constructors}) =>
+      if constructors->Array.every(constructor =>
+           switch constructor.payload {
+           | NoPayload => true
+           | _ => false
+           }
+         ) {
+        switch constructors->Array.find(c => Option.isSome(c.unpack(value))) {
+        | Some(constructor) => JSON.String(constructor.name)
+        | None => failwith("variant value did not match any constructor")
+        }
+      } else {
+        failwith("see sample code for full payload-variant encoding")
+      }
     }
-  | _ => failwith("makeJsonEncoder only supports record types")
-  }
+
+  let desc = reflect()
+  (value: t) => encodeByType(desc, value)
 }
 ```
 
-For JSON decoding:
+For JSON decoding and generic copying, see:
 
-```rescript
-open Comptime
-
-let makeJsonDecoder: type t. unit => JSON.t => option<t> = () => {
-  switch reflect() {
-  | Record({fields}) =>
-    let decodeField = (field, obj) =>
-      switch field.typ {
-      | String =>
-        switch Dict.get(obj, field.name) {
-        | Some(JSON.String(value)) => Some(value)
-        | _ => None
-        }
-      | Int =>
-        switch Dict.get(obj, field.name) {
-        | Some(JSON.Number(value)) => Some(Float.toInt(value))
-        | _ => None
-        }
-      | Bool =>
-        switch Dict.get(obj, field.name) {
-        | Some(JSON.Boolean(value)) => Some(value)
-        | _ => None
-        }
-      | _ => failwith("makeJsonDecoder only supports string, int, and bool fields")
-      }
-
-    let finish = (_obj, builder) => Some(builder)
-
-    let addDecodedField = (next, field) => (obj, builder) =>
-      switch decodeField(field, obj) {
-      | Some(value) =>
-        let nextBuilder = Dict.copy(builder)
-        Dict.set(nextBuilder, field.name, value)
-        next(obj, nextBuilder)
-      | None => None
-      }
-
-    let decodeObject = fields->Array.reduceRight(finish, addDecodedField)
-
-    (json: JSON.t) =>
-      switch json {
-      | JSON.Object(obj) => decodeObject(obj, Dict.make())
-      | _ => None
-      }
-  | _ => failwith("makeJsonDecoder only supports record types")
-  }
-}
-```
-
-And a non-JSON example:
-
-```rescript
-open Comptime
-
-let makeRecordCopy: type t. unit => t => t = () => {
-  switch reflect() {
-  | Record({fields}) =>
-    (value: t) =>
-      fields->Array.reduce(Dict.make(), (builder, field) => {
-        let nextBuilder = Dict.copy(builder)
-        Dict.set(nextBuilder, field.name, field.get(value))
-        nextBuilder
-      })
-  | _ => failwith("makeRecordCopy only supports record types")
-  }
-}
-```
+- [tests/comptime_test/src/comptime_test.res](/Users/mununki/github/mununki/rescript/tests/comptime_test/src/comptime_test.res)
+- [src/Main.res](/Users/mununki/github/mununki/rescript-comptime-poc/src/Main.res)
 
 Call sites:
 
 ```rescript
 let encodeUser: user => JSON.t = %comptime(makeJsonEncoder())
 let decodeUser: JSON.t => option<user> = %comptime(makeJsonDecoder())
-let copyUser: user => user = %comptime(makeRecordCopy())
+let copyUser: user => user = %comptime(makeCopy())
+let encodeShape: shape => JSON.t = %comptime(makeJsonEncoder())
+let decodeShape: JSON.t => option<shape> = %comptime(makeJsonDecoder())
+let copyShape: shape => shape = %comptime(makeCopy())
 ```
 
 ## Conceptual Expansion
@@ -268,7 +257,7 @@ let decodeUser = (json: JSON.t) =>
   }
 ```
 
-And `makeRecordCopy` becomes a plain record copy function.
+And tuple / variant / list / result generators expand to ordinary runtime code in the same way.
 
 ## Current Implementation Notes
 
@@ -276,7 +265,7 @@ The current implementation uses a typed lowering and evaluator after the first
 typecheck. That means the current system is already useful for:
 
 - compile-time constant evaluation
-- ordinary record-driven code generation
+- record / tuple / variant / list / result driven code generation
 - removing user-authored generator helpers from runtime output
 
 ## Comparison with Zig
@@ -297,7 +286,8 @@ The important differences are:
   language, while this ReScript implementation currently runs as a dedicated
   typed comptime phase after the first typecheck
 - Zig allows much broader compile-time execution, while this implementation is
-  intentionally narrower and centered on reflected record-driven generators
+  intentionally narrower and centered on reflected record / tuple / variant
+  generators
 - Zig does not need a surface like `%comptime(...)`; ReScript keeps one explicit
   compile-time boundary
 

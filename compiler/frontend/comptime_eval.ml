@@ -16,9 +16,26 @@ type resolved_type =
   | Type_json
   | Type_option of resolved_type
   | Type_array of resolved_type
+  | Type_list of resolved_type
   | Type_record of string * resolved_field list
+  | Type_tuple of resolved_item list
+  | Type_variant of string * resolved_constructor list
 
 and resolved_field = {field_name: string; field_type: resolved_type}
+
+and resolved_item = {item_index: int; item_arity: int; item_type: resolved_type}
+
+and resolved_constructor_payload =
+  | Payload_none
+  | Payload_single of resolved_type
+  | Payload_tuple of resolved_item list
+
+and resolved_constructor = {
+  constructor_name: string;
+  constructor_payload: resolved_constructor_payload;
+}
+
+type builder_kind = Builder_unknown | Builder_tuple
 
 type value =
   | VUnit
@@ -32,7 +49,7 @@ type value =
   | VVariant of string * value option
   | VClosure of closure
   | VBuiltin of builtin
-  | VBuilder of (string * expression) list ref
+  | VBuilder of builder_kind ref * (string * expression) list ref
   | VCode of expression
 
 and closure = {pattern: Ir.pattern; body: Ir.expr; env: value Ident.tbl ref}
@@ -84,9 +101,13 @@ let is_comptime_constructor ctor_lid name =
   &&
   match name with
   | "()" | "true" | "false" | "None" | "Some" | "String" | "Int" | "Float"
-  | "Bool" | "Json" | "Option" | "Array" | "Record" | "StringField" | "IntField"
+  | "Bool" | "Json" | "Option" | "Array" | "List" | "Record" | "Tuple"
+  | "Variant" | "NoPayload" | "Single" | "StringField" | "IntField"
   | "FloatField" | "BoolField" | "JsonField" | "OptionField" | "ArrayField"
-  | "RecordField" ->
+  | "ListField" | "RecordField" | "TupleField" | "VariantField" | "StringItem"
+  | "IntItem" | "FloatItem" | "BoolItem" | "JsonItem" | "OptionItem"
+  | "ArrayItem" | "ListItem" | "RecordItem" | "TupleItem" | "VariantItem"
+  | "NoPayloadConstructor" | "SingleConstructor" | "TupleConstructor" ->
     true
   | _ -> false
 
@@ -100,50 +121,112 @@ let is_json_path path =
   String.ends_with ~suffix:"JSON.t" name
   || String.ends_with ~suffix:"Stdlib_JSON.t" name
 
-let rec resolve_type env (ty : Types.type_expr) =
-  let ty = Ctype.repr ty in
-  match ty.desc with
-  | Types.Tconstr (path, [], _) -> (
-    match Path.name path with
-    | "string" -> Type_string
-    | "int" -> Type_int
-    | "float" -> Type_float
-    | "bool" -> Type_bool
-    | _ when is_json_path path -> Type_json
-    | _ -> (
-      let decl = Env.find_type path env in
-      if decl.type_params <> [] then
-        errorf ~loc:Location.none
-          "Generic types are not supported in comptime reflection";
-      match decl.type_kind with
-      | Types.Type_record (labels, _) ->
-        Type_record
-          ( Path.last path,
-            List.map
-              (fun label ->
-                {
-                  field_name = Ident.name label.Types.ld_id;
-                  field_type = resolve_type env label.Types.ld_type;
-                })
-              labels )
-      | Types.Type_abstract -> (
-        match decl.type_manifest with
-        | Some manifest -> resolve_type env manifest
-        | None ->
+let resolve_type env ty =
+  let rec loop visited ty =
+    let ty = Ctype.repr ty in
+    match ty.desc with
+    | Types.Ttuple tys ->
+      Type_tuple
+        (List.mapi
+           (fun item_index item_type ->
+             {
+               item_index;
+               item_arity = List.length tys;
+               item_type = loop visited item_type;
+             })
+           tys)
+    | Types.Tconstr (path, [inner], _) when Path.name path = "option" ->
+      Type_option (loop visited inner)
+    | Types.Tconstr (path, [inner], _) when Path.name path = "array" ->
+      Type_array (loop visited inner)
+    | Types.Tconstr (path, [inner], _) when Path.name path = "list" ->
+      Type_list (loop visited inner)
+    | Types.Tconstr (path, [ok_ty; err_ty], _) when Path.name path = "result" ->
+      Type_variant
+        ( "result",
+          [
+            {
+              constructor_name = "Ok";
+              constructor_payload = Payload_single (loop visited ok_ty);
+            };
+            {
+              constructor_name = "Error";
+              constructor_payload = Payload_single (loop visited err_ty);
+            };
+          ] )
+    | Types.Tconstr (path, [], _) -> (
+      match Path.name path with
+      | "string" -> Type_string
+      | "int" -> Type_int
+      | "float" -> Type_float
+      | "bool" -> Type_bool
+      | _ when is_json_path path -> Type_json
+      | type_name -> (
+        if List.mem type_name visited then
           errorf ~loc:Location.none
-            "Abstract types are not supported in comptime reflection")
-      | Types.Type_variant _ ->
-        errorf ~loc:Location.none
-          "Variant types are not supported in comptime reflection"
-      | Types.Type_open ->
-        errorf ~loc:Location.none
-          "Open types are not supported in comptime reflection"))
-  | Types.Tconstr (path, [inner], _) when Path.name path = "option" ->
-    Type_option (resolve_type env inner)
-  | Types.Tconstr (path, [inner], _) when Path.name path = "array" ->
-    Type_array (resolve_type env inner)
-  | _ ->
-    errorf ~loc:Location.none "Unsupported type shape in comptime reflection"
+            "Recursive types are not supported in comptime reflection";
+        let decl = Env.find_type path env in
+        if decl.type_params <> [] then
+          errorf ~loc:Location.none
+            "Generic types are not supported in comptime reflection";
+        match decl.type_kind with
+        | Types.Type_record (labels, _) ->
+          Type_record
+            ( Path.last path,
+              List.map
+                (fun label ->
+                  {
+                    field_name = Ident.name label.Types.ld_id;
+                    field_type = loop (type_name :: visited) label.Types.ld_type;
+                  })
+                labels )
+        | Types.Type_variant constructors ->
+          Type_variant
+            ( Path.last path,
+              List.map
+                (fun constructor ->
+                  let constructor_payload =
+                    match constructor.Types.cd_args with
+                    | Types.Cstr_tuple [] -> Payload_none
+                    | Types.Cstr_tuple [inner] ->
+                      Payload_single (loop (type_name :: visited) inner)
+                    | Types.Cstr_tuple inners ->
+                      Payload_tuple
+                        (List.mapi
+                           (fun item_index item_type ->
+                             {
+                               item_index;
+                               item_arity = List.length inners;
+                               item_type = loop (type_name :: visited) item_type;
+                             })
+                           inners)
+                    | Types.Cstr_record _ ->
+                      errorf ~loc:constructor.Types.cd_loc
+                        "Inline-record variant constructors are not supported \
+                         in comptime reflection"
+                  in
+                  if constructor.Types.cd_res <> None then
+                    errorf ~loc:constructor.Types.cd_loc
+                      "GADT constructors are not supported in comptime \
+                       reflection";
+                  {
+                    constructor_name = Ident.name constructor.Types.cd_id;
+                    constructor_payload;
+                  })
+                constructors )
+        | Types.Type_abstract -> (
+          match decl.type_manifest with
+          | Some manifest -> loop (type_name :: visited) manifest
+          | None ->
+            errorf ~loc:Location.none
+              "Abstract types are not supported in comptime reflection")
+        | Types.Type_open ->
+          errorf ~loc:Location.none
+            "Open types are not supported in comptime reflection"))
+    | _ ->
+      errorf ~loc:Location.none "Unsupported type shape in comptime reflection"
+  in
+  loop [] ty
 
 let field_get_builtin field_name =
   VBuiltin
@@ -160,7 +243,453 @@ let field_get_builtin field_name =
               "Reflected field getter expects a runtime record expression");
     }
 
-let rec type_desc_value_of_resolved_type = function
+let tuple_item_get_builtin item_index item_count =
+  VBuiltin
+    {
+      arity = 1;
+      apply =
+        (fun _context loc args ->
+          let tuple_projection expr =
+            let names =
+              List.init item_count (fun index ->
+                  "tuple$" ^ string_of_int item_index ^ "$"
+                  ^ string_of_int index)
+            in
+            let tuple_pattern =
+              Pat.tuple
+                (List.map (fun name -> Pat.var (Location.mknoloc name)) names)
+            in
+            let selected =
+              Exp.ident
+                (Location.mknoloc
+                   (Longident.Lident (List.nth names item_index)))
+            in
+            Exp.match_ expr [Exp.case tuple_pattern selected]
+          in
+          match args with
+          | [VCode expr] -> VCode (tuple_projection expr)
+          | _ ->
+            errorf ~loc
+              "Reflected tuple item getter expects a runtime tuple expression");
+    }
+
+let constructor_unpack_builtin constructor_name payload =
+  VBuiltin
+    {
+      arity = 1;
+      apply =
+        (fun _context loc args ->
+          let match_cases () =
+            match payload with
+            | Payload_none ->
+              [
+                Exp.case
+                  (Pat.construct (lid constructor_name) None)
+                  (exp_some (Exp.construct (lid "()") None));
+                Exp.case (Pat.any ()) (exp_none ());
+              ]
+            | Payload_single _ ->
+              let payload_name = "payload$comptime" in
+              [
+                Exp.case
+                  (Pat.construct (lid constructor_name)
+                     (Some (Pat.var (Location.mknoloc payload_name))))
+                  (exp_some
+                     (Exp.ident
+                        (Location.mknoloc (Longident.Lident payload_name))));
+                Exp.case (Pat.any ()) (exp_none ());
+              ]
+            | Payload_tuple items ->
+              let names =
+                List.map
+                  (fun item ->
+                    "payload$comptime" ^ string_of_int item.item_index)
+                  items
+              in
+              [
+                Exp.case
+                  (Pat.construct (lid constructor_name)
+                     (Some
+                        (Pat.tuple
+                           (List.map
+                              (fun name -> Pat.var (Location.mknoloc name))
+                              names))))
+                  (exp_some
+                     (Exp.tuple
+                        (List.map
+                           (fun name ->
+                             Exp.ident
+                               (Location.mknoloc (Longident.Lident name)))
+                           names)));
+                Exp.case (Pat.any ()) (exp_none ());
+              ]
+          in
+          match args with
+          | [VCode expr] -> VCode (Exp.match_ expr (match_cases ()))
+          | _ ->
+            errorf ~loc
+              "Reflected constructor unpack expects a runtime variant \
+               expression");
+    }
+
+let constructor_make_builtin constructor_name payload =
+  VBuiltin
+    {
+      arity = 1;
+      apply =
+        (fun _context loc args ->
+          let constructor_application_expr names =
+            let source =
+              "let __comptime_ctor = " ^ constructor_name ^ "("
+              ^ String.concat ", " names ^ ")"
+            in
+            match
+              Res_driver.parse_implementation_from_source ~for_printer:false
+                ~display_filename:"__comptime_constructor__.res" ~source
+            with
+            | {
+             parsetree = [{pstr_desc = Pstr_value (_, [{pvb_expr; _}]); _}];
+             _;
+            } ->
+              pvb_expr
+            | _ ->
+              errorf ~loc
+                "Failed to lower reflected constructor application for `%s`"
+                constructor_name
+          in
+          let rec payload_expr resolved value =
+            match (resolved, value) with
+            | _, VCode expr -> expr
+            | _, VUnit -> Exp.construct (lid "()") None
+            | _, VInt i -> exp_int i
+            | _, VFloat f -> exp_float f
+            | _, VString s -> exp_string s
+            | _, VBool b -> exp_bool b
+            | Some (Type_option _), VVariant ("None", None) -> exp_none ()
+            | Some (Type_option inner), VVariant ("Some", Some value) ->
+              exp_some (payload_expr (Some inner) value)
+            | Some (Type_array inner), VArray values ->
+              Exp.array (List.map (payload_expr (Some inner)) values)
+            | Some (Type_list inner), VArray values ->
+              Exp.apply
+                (Exp.ident
+                   (Location.mknoloc
+                      (Longident.Ldot (Longident.Lident "List", "fromArray"))))
+                [
+                  ( Nolabel,
+                    Exp.array (List.map (payload_expr (Some inner)) values) );
+                ]
+            | Some (Type_tuple items), VTuple values ->
+              Exp.tuple
+                (List.map2
+                   (fun item value -> payload_expr (Some item.item_type) value)
+                   items values)
+            | Some (Type_tuple items), VBuilder (_, builder) ->
+              let find_entry index =
+                List.find_opt
+                  (fun (name, _) -> name = string_of_int index)
+                  !builder
+              in
+              Exp.tuple
+                (List.map
+                   (fun item ->
+                     match find_entry item.item_index with
+                     | Some (_, expr) -> expr
+                     | None ->
+                       errorf ~loc
+                         "Missing tuple item %d in reflected constructor \
+                          payload"
+                         item.item_index)
+                   items)
+            | Some (Type_record (_name, fields)), VBuilder (_, builder) ->
+              let find_entry field_name =
+                List.find_opt (fun (name, _) -> name = field_name) !builder
+              in
+              Exp.record
+                (List.map
+                   (fun field ->
+                     match find_entry field.field_name with
+                     | Some (_, expr) ->
+                       {
+                         lid =
+                           Location.mknoloc (Longident.Lident field.field_name);
+                         x = expr;
+                         opt = false;
+                       }
+                     | None ->
+                       errorf ~loc
+                         "Missing field `%s` in reflected constructor payload"
+                         field.field_name)
+                   fields)
+                None
+            | _, VTuple values ->
+              Exp.tuple (List.map (payload_expr None) values)
+            | _, VArray values ->
+              Exp.array (List.map (payload_expr None) values)
+            | _ ->
+              errorf ~loc
+                "Reflected constructor make expects a runtime expression or \
+                 reifiable payload"
+          in
+          let resolved_payload =
+            match payload with
+            | Payload_none -> None
+            | Payload_single inner -> Some inner
+            | Payload_tuple items -> Some (Type_tuple items)
+          in
+          let tuple_payload_exprs items value =
+            match value with
+            | VTuple values ->
+              List.map2
+                (fun item value -> payload_expr (Some item.item_type) value)
+                items values
+            | VBuilder (_, builder) ->
+              let find_entry index =
+                List.find_opt
+                  (fun (name, _) -> name = string_of_int index)
+                  !builder
+              in
+              List.map
+                (fun item ->
+                  match find_entry item.item_index with
+                  | Some (_, expr) -> expr
+                  | None ->
+                    errorf ~loc
+                      "Missing tuple item %d in reflected constructor payload"
+                      item.item_index)
+                items
+            | _ ->
+              errorf ~loc
+                "Reflected tuple constructor make expects a tuple payload"
+          in
+          match (payload, args) with
+          | Payload_none, [VUnit] ->
+            VCode (Exp.construct (lid constructor_name) None)
+          | Payload_none, [value] ->
+            let payload = payload_expr None value in
+            VCode
+              (Exp.match_ payload
+                 [
+                   Exp.case
+                     (Pat.construct (lid "()") None)
+                     (Exp.construct (lid constructor_name) None);
+                 ])
+          | Payload_single _, [value] ->
+            VCode
+              (Exp.construct (lid constructor_name)
+                 (Some (payload_expr resolved_payload value)))
+          | Payload_tuple items, [VCode tuple_expr] ->
+            let names =
+              List.map
+                (fun item -> "payloadComptime" ^ string_of_int item.item_index)
+                items
+            in
+            let applied = constructor_application_expr names in
+            VCode
+              (Exp.match_ tuple_expr
+                 [
+                   Exp.case
+                     (Pat.tuple
+                        (List.map
+                           (fun name -> Pat.var (Location.mknoloc name))
+                           names))
+                     applied;
+                 ])
+          | Payload_tuple items, [value] ->
+            let names =
+              List.map
+                (fun item -> "payloadComptime" ^ string_of_int item.item_index)
+                items
+            in
+            let bindings =
+              List.map2
+                (fun name expr -> Vb.mk (Pat.var (Location.mknoloc name)) expr)
+                names
+                (tuple_payload_exprs items value)
+            in
+            VCode
+              (Exp.let_ Nonrecursive bindings
+                 (constructor_application_expr names))
+          | _ -> errorf ~loc "Reflected constructor make expects one payload");
+    }
+
+let rec field_record_payload field_name field_type =
+  let payload =
+    StringMap.empty
+    |> StringMap.add "fieldName" (VString field_name)
+    |> StringMap.add "fieldGet" (field_get_builtin field_name)
+    |> StringMap.add "__type" (type_desc_value_of_resolved_type field_type)
+  in
+  match field_type with
+  | Type_string -> VVariant ("StringField", Some (VRecord payload))
+  | Type_int -> VVariant ("IntField", Some (VRecord payload))
+  | Type_float -> VVariant ("FloatField", Some (VRecord payload))
+  | Type_bool -> VVariant ("BoolField", Some (VRecord payload))
+  | Type_json -> VVariant ("JsonField", Some (VRecord payload))
+  | Type_option inner ->
+    VVariant
+      ( "OptionField",
+        Some
+          (VRecord
+             (StringMap.add "fieldInner"
+                (type_desc_value_of_resolved_type inner)
+                payload)) )
+  | Type_array inner ->
+    VVariant
+      ( "ArrayField",
+        Some
+          (VRecord
+             (StringMap.add "fieldInner"
+                (type_desc_value_of_resolved_type inner)
+                payload)) )
+  | Type_list inner ->
+    VVariant
+      ( "ListField",
+        Some
+          (VRecord
+             (StringMap.add "fieldInner"
+                (type_desc_value_of_resolved_type inner)
+                payload)) )
+  | Type_record (_name, fields) ->
+    VVariant
+      ( "RecordField",
+        Some
+          (VRecord
+             (StringMap.add "fieldFields"
+                (VArray (List.map field_value_of_resolved_field fields))
+                payload)) )
+  | Type_tuple items ->
+    VVariant
+      ( "TupleField",
+        Some
+          (VRecord
+             (StringMap.add "fieldItems"
+                (VArray (List.map item_value_of_resolved_item items))
+                payload)) )
+  | Type_variant (_name, constructors) ->
+    VVariant
+      ( "VariantField",
+        Some
+          (VRecord
+             (StringMap.add "fieldConstructors"
+                (VArray
+                   (List.map constructor_value_of_resolved_constructor
+                      constructors))
+                payload)) )
+
+and item_value_of_resolved_item item =
+  let payload =
+    StringMap.empty
+    |> StringMap.add "itemIndex" (VInt item.item_index)
+    |> StringMap.add "itemGet"
+         (tuple_item_get_builtin item.item_index item.item_arity)
+    |> StringMap.add "__type" (type_desc_value_of_resolved_type item.item_type)
+  in
+  match item.item_type with
+  | Type_string -> VVariant ("StringItem", Some (VRecord payload))
+  | Type_int -> VVariant ("IntItem", Some (VRecord payload))
+  | Type_float -> VVariant ("FloatItem", Some (VRecord payload))
+  | Type_bool -> VVariant ("BoolItem", Some (VRecord payload))
+  | Type_json -> VVariant ("JsonItem", Some (VRecord payload))
+  | Type_option inner ->
+    VVariant
+      ( "OptionItem",
+        Some
+          (VRecord
+             (StringMap.add "itemInner"
+                (type_desc_value_of_resolved_type inner)
+                payload)) )
+  | Type_array inner ->
+    VVariant
+      ( "ArrayItem",
+        Some
+          (VRecord
+             (StringMap.add "itemInner"
+                (type_desc_value_of_resolved_type inner)
+                payload)) )
+  | Type_list inner ->
+    VVariant
+      ( "ListItem",
+        Some
+          (VRecord
+             (StringMap.add "itemInner"
+                (type_desc_value_of_resolved_type inner)
+                payload)) )
+  | Type_record (_name, fields) ->
+    VVariant
+      ( "RecordItem",
+        Some
+          (VRecord
+             (StringMap.add "itemFields"
+                (VArray (List.map field_value_of_resolved_field fields))
+                payload)) )
+  | Type_tuple items ->
+    VVariant
+      ( "TupleItem",
+        Some
+          (VRecord
+             (StringMap.add "itemItems"
+                (VArray (List.map item_value_of_resolved_item items))
+                payload)) )
+  | Type_variant (_name, constructors) ->
+    VVariant
+      ( "VariantItem",
+        Some
+          (VRecord
+             (StringMap.add "itemConstructors"
+                (VArray
+                   (List.map constructor_value_of_resolved_constructor
+                      constructors))
+                payload)) )
+
+and constructor_value_of_resolved_constructor constructor =
+  let payload =
+    StringMap.empty
+    |> StringMap.add "constructorName" (VString constructor.constructor_name)
+    |> StringMap.add "__payload"
+         (match constructor.constructor_payload with
+         | Payload_none -> VVariant ("NoPayload", None)
+         | Payload_single inner ->
+           VVariant ("Single", Some (type_desc_value_of_resolved_type inner))
+         | Payload_tuple items ->
+           VVariant
+             ( "Tuple",
+               Some
+                 (VRecord
+                    (StringMap.empty
+                    |> StringMap.add "items"
+                         (VArray (List.map item_value_of_resolved_item items))))
+             ))
+    |> StringMap.add "constructorUnpack"
+         (constructor_unpack_builtin constructor.constructor_name
+            constructor.constructor_payload)
+    |> StringMap.add "constructorMake"
+         (constructor_make_builtin constructor.constructor_name
+            constructor.constructor_payload)
+  in
+  match constructor.constructor_payload with
+  | Payload_none -> VVariant ("NoPayloadConstructor", Some (VRecord payload))
+  | Payload_single inner ->
+    VVariant
+      ( "SingleConstructor",
+        Some
+          (VRecord
+             (StringMap.add "constructorInner"
+                (type_desc_value_of_resolved_type inner)
+                payload)) )
+  | Payload_tuple items ->
+    VVariant
+      ( "TupleConstructor",
+        Some
+          (VRecord
+             (StringMap.add "constructorItems"
+                (VArray (List.map item_value_of_resolved_item items))
+                payload)) )
+
+and field_value_of_resolved_field field =
+  field_record_payload field.field_name field.field_type
+
+and type_desc_value_of_resolved_type = function
   | Type_string -> VVariant ("String", None)
   | Type_int -> VVariant ("Int", None)
   | Type_float -> VVariant ("Float", None)
@@ -170,38 +699,36 @@ let rec type_desc_value_of_resolved_type = function
     VVariant ("Option", Some (type_desc_value_of_resolved_type inner))
   | Type_array inner ->
     VVariant ("Array", Some (type_desc_value_of_resolved_type inner))
+  | Type_list inner ->
+    VVariant ("List", Some (type_desc_value_of_resolved_type inner))
   | Type_record (name, fields) ->
-    let fields_value =
-      VArray
-        (List.map
-           (fun field ->
-             let ctor =
-               match field.field_type with
-               | Type_string -> "StringField"
-               | Type_int -> "IntField"
-               | Type_float -> "FloatField"
-               | Type_bool -> "BoolField"
-               | Type_json -> "JsonField"
-               | Type_option _ -> "OptionField"
-               | Type_array _ -> "ArrayField"
-               | Type_record _ -> "RecordField"
-             in
-             let payload =
-               VRecord
-                 (StringMap.empty
-                 |> StringMap.add "name" (VString field.field_name)
-                 |> StringMap.add "get" (field_get_builtin field.field_name))
-             in
-             VVariant (ctor, Some payload))
-           fields)
-    in
+    let fields_value = VArray (List.map field_value_of_resolved_field fields) in
     VVariant
       ( "Record",
         Some
           (VRecord
              (StringMap.empty
-             |> StringMap.add "name" (VString name)
+             |> StringMap.add "recordName" (VString name)
              |> StringMap.add "fields" fields_value)) )
+  | Type_tuple items ->
+    VVariant
+      ( "Tuple",
+        Some
+          (VRecord
+             (StringMap.empty
+             |> StringMap.add "items"
+                  (VArray (List.map item_value_of_resolved_item items)))) )
+  | Type_variant (name, constructors) ->
+    VVariant
+      ( "Variant",
+        Some
+          (VRecord
+             (StringMap.empty
+             |> StringMap.add "variantName" (VString name)
+             |> StringMap.add "constructors"
+                  (VArray
+                     (List.map constructor_value_of_resolved_constructor
+                        constructors)))) )
 
 let expected_type_of_some_payload ty =
   let ty = Ctype.repr ty in
@@ -225,26 +752,59 @@ let builder_entries_set builder field_name value_expr =
   in
   builder := loop [] !builder
 
-let resolve_builder_field_name ~loc = function
-  | VString field_name -> field_name
+let builder_kind_of_key = function
+  | VInt _ -> Some Builder_tuple
   | VRecord field -> (
-    match StringMap.find_opt "name" field with
-    | Some (VString field_name) -> field_name
-    | _ ->
-      errorf ~loc
-        "Dict.set on a comptime builder expects a compile-time string or \
-         reflected field descriptor")
+    match StringMap.find_opt "itemIndex" field with
+    | Some (VInt _) -> Some Builder_tuple
+    | _ -> (
+      match StringMap.find_opt "index" field with
+      | Some (VInt _) -> Some Builder_tuple
+      | _ -> None))
   | VVariant (_, Some (VRecord field)) -> (
-    match StringMap.find_opt "name" field with
-    | Some (VString field_name) -> field_name
-    | _ ->
+    match StringMap.find_opt "itemIndex" field with
+    | Some (VInt _) -> Some Builder_tuple
+    | _ -> (
+      match StringMap.find_opt "index" field with
+      | Some (VInt _) -> Some Builder_tuple
+      | _ -> None))
+  | _ -> None
+
+let reflected_member_key field =
+  match StringMap.find_opt "itemIndex" field with
+  | Some (VInt index) -> Some (string_of_int index)
+  | _ -> (
+    match StringMap.find_opt "fieldName" field with
+    | Some (VString name) -> Some name
+    | _ -> (
+      match StringMap.find_opt "index" field with
+      | Some (VInt index) -> Some (string_of_int index)
+      | _ -> (
+        match StringMap.find_opt "name" field with
+        | Some (VString name) -> Some name
+        | _ -> None)))
+
+let resolve_builder_key ~loc = function
+  | VString field_name -> field_name
+  | VInt index -> string_of_int index
+  | VRecord field -> (
+    match reflected_member_key field with
+    | Some key -> key
+    | None ->
       errorf ~loc
-        "Dict.set on a comptime builder expects a compile-time string or \
-         reflected field descriptor")
+        "Dict.set on a comptime builder expects a compile-time string, int, or \
+         reflected member descriptor")
+  | VVariant (_, Some (VRecord field)) -> (
+    match reflected_member_key field with
+    | Some key -> key
+    | None ->
+      errorf ~loc
+        "Dict.set on a comptime builder expects a compile-time string, int, or \
+         reflected member descriptor")
   | _ ->
     errorf ~loc
-      "Dict.set on a comptime builder expects a compile-time string or \
-       reflected field descriptor"
+      "Dict.set on a comptime builder expects a compile-time string, int, or \
+       reflected member descriptor"
 
 let resolve_builder_expected_type context expected =
   try Some (resolve_type context.type_env expected) with
@@ -271,8 +831,21 @@ let rec expr_of_value ~loc ?expected_type context = function
   | VArray values -> Exp.array (List.map (expr_of_value ~loc context) values)
   | VTuple values -> Exp.tuple (List.map (expr_of_value ~loc context) values)
   | VCode expr -> expr
-  | VBuilder builder -> (
+  | VBuilder (kind, builder) -> (
     let entries = !builder in
+    let tuple_expr () =
+      let parse_index name =
+        try int_of_string name
+        with Failure _ -> errorf ~loc "Invalid tuple builder key `%s`" name
+      in
+      let entries =
+        List.sort
+          (fun (left, _) (right, _) ->
+            compare (parse_index left) (parse_index right))
+          entries
+      in
+      Exp.tuple (List.map snd entries)
+    in
     match expected_type with
     | Some expected -> (
       match resolve_builder_expected_type context expected with
@@ -296,7 +869,37 @@ let rec expr_of_value ~loc ?expected_type context = function
             fields
         in
         Exp.record rows None
-      | Some _ | None ->
+      | Some (Type_tuple items) ->
+        let find_entry index =
+          List.find_opt (fun (name, _) -> name = string_of_int index) entries
+        in
+        Exp.tuple
+          (List.map
+             (fun item ->
+               match find_entry item.item_index with
+               | Some (_, expr) -> expr
+               | None ->
+                 errorf ~loc "Missing tuple item %d in comptime construction"
+                   item.item_index)
+             items)
+      | Some _ | None -> (
+        match !kind with
+        | Builder_tuple -> tuple_expr ()
+        | Builder_unknown ->
+          let tuple_entries =
+            List.map
+              (fun (name, expr) -> Exp.tuple [exp_string name; expr])
+              entries
+          in
+          Exp.apply
+            (Exp.ident
+               (Location.mknoloc
+                  (Longident.Ldot (Longident.Lident "Dict", "fromArray"))))
+            [(Nolabel, Exp.array tuple_entries)]))
+    | None -> (
+      match !kind with
+      | Builder_tuple -> tuple_expr ()
+      | Builder_unknown ->
         let tuple_entries =
           List.map
             (fun (name, expr) -> Exp.tuple [exp_string name; expr])
@@ -306,16 +909,7 @@ let rec expr_of_value ~loc ?expected_type context = function
           (Exp.ident
              (Location.mknoloc
                 (Longident.Ldot (Longident.Lident "Dict", "fromArray"))))
-          [(Nolabel, Exp.array tuple_entries)])
-    | None ->
-      let tuple_entries =
-        List.map (fun (name, expr) -> Exp.tuple [exp_string name; expr]) entries
-      in
-      Exp.apply
-        (Exp.ident
-           (Location.mknoloc
-              (Longident.Ldot (Longident.Lident "Dict", "fromArray"))))
-        [(Nolabel, Exp.array tuple_entries)])
+          [(Nolabel, Exp.array tuple_entries)]))
   | VClosure closure -> expr_of_closure ~loc ?expected_type context closure
   | _ -> errorf ~loc "Unsupported comptime value reification"
 
@@ -557,6 +1151,27 @@ and eval_ident context loc = function
     let unary f = VBuiltin {arity = 1; apply = f} in
     let binary f = VBuiltin {arity = 2; apply = f} in
     let ternary f = VBuiltin {arity = 3; apply = f} in
+    let runtime_callback_expr context loc fn arity =
+      let names =
+        List.init arity (fun index -> "arg$comptime" ^ string_of_int index)
+      in
+      let args = List.map (fun name -> VCode (exp_ident name)) names in
+      let body =
+        runtime_expr_of_value ~loc context (apply context ~loc fn args)
+      in
+      let body =
+        List.fold_right
+          (fun name body ->
+            Ast_compatible.fun_ ~loc ~arity:None
+              (Pat.var (Location.mknoloc name))
+              body)
+          names body
+      in
+      match body.pexp_desc with
+      | Pexp_fun f ->
+        {body with pexp_desc = Pexp_fun {f with arity = Some arity}}
+      | _ -> body
+    in
     let value =
       match builtin with
       | Ir.BReflect ->
@@ -577,11 +1192,21 @@ and eval_ident context loc = function
             match args with
             | [VString message] -> errorf ~loc "%s" message
             | _ -> errorf ~loc "failwith expects a string")
+      | Ir.BFieldType ->
+        unary (fun _context loc args ->
+            match args with
+            | [VVariant (_, Some (VRecord field))] -> (
+              match StringMap.find_opt "__type" field with
+              | Some value -> value
+              | None ->
+                errorf ~loc "__fieldType expects a reflected field descriptor")
+            | _ ->
+              errorf ~loc "__fieldType expects a reflected field descriptor")
       | Ir.BFieldName ->
         unary (fun _context loc args ->
             match args with
             | [VVariant (_, Some (VRecord field))] -> (
-              match StringMap.find_opt "name" field with
+              match StringMap.find_opt "fieldName" field with
               | Some (VString name) -> VString name
               | _ ->
                 errorf ~loc "__fieldName expects a reflected field descriptor")
@@ -591,14 +1216,14 @@ and eval_ident context loc = function
         binary (fun _context loc args ->
             match args with
             | [VVariant (_, Some (VRecord field)); VCode expr] -> (
-              match StringMap.find_opt "name" field with
+              match StringMap.find_opt "fieldName" field with
               | Some (VString name) ->
                 VCode
                   (Exp.field expr (Location.mknoloc (Longident.Lident name)))
               | _ ->
                 errorf ~loc "__fieldGet expects a reflected field descriptor")
             | [VRecord field; VCode expr] -> (
-              match StringMap.find_opt "name" field with
+              match StringMap.find_opt "fieldName" field with
               | Some (VString name) ->
                 VCode
                   (Exp.field expr (Location.mknoloc (Longident.Lident name)))
@@ -608,6 +1233,97 @@ and eval_ident context loc = function
               errorf ~loc
                 "__fieldGet expects a reflected field descriptor and runtime \
                  value")
+      | Ir.BItemType ->
+        unary (fun _context loc args ->
+            match args with
+            | [VVariant (_, Some (VRecord item))] -> (
+              match StringMap.find_opt "__type" item with
+              | Some value -> value
+              | None ->
+                errorf ~loc
+                  "__itemType expects a reflected tuple item descriptor")
+            | _ ->
+              errorf ~loc "__itemType expects a reflected tuple item descriptor")
+      | Ir.BItemIndex ->
+        unary (fun _context loc args ->
+            match args with
+            | [VVariant (_, Some (VRecord item))] -> (
+              match StringMap.find_opt "itemIndex" item with
+              | Some (VInt index) -> VInt index
+              | _ ->
+                errorf ~loc
+                  "__itemIndex expects a reflected tuple item descriptor")
+            | _ ->
+              errorf ~loc
+                "__itemIndex expects a reflected tuple item descriptor")
+      | Ir.BItemGet ->
+        binary (fun _context loc args ->
+            match args with
+            | [VVariant (_, Some (VRecord item)); VCode expr] -> (
+              match StringMap.find_opt "itemGet" item with
+              | Some getter -> apply context ~loc getter [VCode expr]
+              | None ->
+                errorf ~loc
+                  "__itemGet expects a reflected tuple item descriptor")
+            | _ ->
+              errorf ~loc
+                "__itemGet expects a reflected tuple item descriptor and \
+                 runtime value")
+      | Ir.BConstructorPayload ->
+        unary (fun _context loc args ->
+            match args with
+            | [VVariant (_, Some (VRecord constructor))] -> (
+              match StringMap.find_opt "__payload" constructor with
+              | Some value -> value
+              | None ->
+                errorf ~loc
+                  "__constructorPayload expects a reflected constructor \
+                   descriptor")
+            | _ ->
+              errorf ~loc
+                "__constructorPayload expects a reflected constructor \
+                 descriptor")
+      | Ir.BConstructorName ->
+        unary (fun _context loc args ->
+            match args with
+            | [VVariant (_, Some (VRecord constructor))] -> (
+              match StringMap.find_opt "constructorName" constructor with
+              | Some (VString name) -> VString name
+              | _ ->
+                errorf ~loc
+                  "__constructorName expects a reflected constructor descriptor"
+              )
+            | _ ->
+              errorf ~loc
+                "__constructorName expects a reflected constructor descriptor")
+      | Ir.BConstructorUnpack ->
+        binary (fun _context loc args ->
+            match args with
+            | [VVariant (_, Some (VRecord constructor)); value] -> (
+              match StringMap.find_opt "constructorUnpack" constructor with
+              | Some unpack -> apply context ~loc unpack [value]
+              | None ->
+                errorf ~loc
+                  "__constructorUnpack expects a reflected constructor \
+                   descriptor")
+            | _ ->
+              errorf ~loc
+                "__constructorUnpack expects a reflected constructor \
+                 descriptor and runtime value")
+      | Ir.BConstructorMake ->
+        binary (fun _context loc args ->
+            match args with
+            | [VVariant (_, Some (VRecord constructor)); value] -> (
+              match StringMap.find_opt "constructorMake" constructor with
+              | Some make -> apply context ~loc make [value]
+              | None ->
+                errorf ~loc
+                  "__constructorMake expects a reflected constructor descriptor"
+              )
+            | _ ->
+              errorf ~loc
+                "__constructorMake expects a reflected constructor descriptor \
+                 and payload")
       | Ir.BErase ->
         unary (fun _context _loc args ->
             match args with
@@ -661,6 +1377,15 @@ and eval_ident context loc = function
             | [VArray values; fn] ->
               VArray
                 (List.map (fun value -> apply context ~loc fn [value]) values)
+            | [array_value; fn]
+              when value_is_runtime array_value || value_is_runtime fn ->
+              let callback = runtime_callback_expr context loc fn 1 in
+              VCode
+                (Exp.apply runtime_expr
+                   [
+                     (Nolabel, runtime_expr_of_value ~loc context array_value);
+                     (Nolabel, callback);
+                   ])
             | _ -> errorf ~loc "Array.map expects an array and a function")
       | Ir.BArrayForEach ->
         binary (fun context loc args ->
@@ -670,6 +1395,15 @@ and eval_ident context loc = function
                 (fun value -> ignore (apply context ~loc fn [value]))
                 values;
               VUnit
+            | [array_value; fn]
+              when value_is_runtime array_value || value_is_runtime fn ->
+              let callback = runtime_callback_expr context loc fn 1 in
+              VCode
+                (Exp.apply runtime_expr
+                   [
+                     (Nolabel, runtime_expr_of_value ~loc context array_value);
+                     (Nolabel, callback);
+                   ])
             | _ -> errorf ~loc "Array.forEach expects an array and a function")
       | Ir.BArrayReduce ->
         ternary (fun context loc args ->
@@ -678,6 +1412,17 @@ and eval_ident context loc = function
               List.fold_left
                 (fun acc value -> apply context ~loc fn [acc; value])
                 init values
+            | [array_value; init; fn]
+              when value_is_runtime array_value
+                   || value_is_runtime init || value_is_runtime fn ->
+              let callback = runtime_callback_expr context loc fn 2 in
+              VCode
+                (Exp.apply runtime_expr
+                   [
+                     (Nolabel, runtime_expr_of_value ~loc context array_value);
+                     (Nolabel, runtime_expr_of_value ~loc context init);
+                     (Nolabel, callback);
+                   ])
             | _ -> errorf ~loc "Array.reduce expects array, init, function")
       | Ir.BArrayReduceRight ->
         ternary (fun context loc args ->
@@ -686,6 +1431,17 @@ and eval_ident context loc = function
               List.fold_right
                 (fun value acc -> apply context ~loc fn [acc; value])
                 values init
+            | [array_value; init; fn]
+              when value_is_runtime array_value
+                   || value_is_runtime init || value_is_runtime fn ->
+              let callback = runtime_callback_expr context loc fn 2 in
+              VCode
+                (Exp.apply runtime_expr
+                   [
+                     (Nolabel, runtime_expr_of_value ~loc context array_value);
+                     (Nolabel, runtime_expr_of_value ~loc context init);
+                     (Nolabel, callback);
+                   ])
             | _ -> errorf ~loc "Array.reduceRight expects array, init, function")
       | Ir.BIntToFloat ->
         unary (fun _context loc args ->
@@ -705,11 +1461,13 @@ and eval_ident context loc = function
                 (Exp.apply runtime_expr
                    [(Nolabel, runtime_expr_of_value ~loc context value)])
             | _ -> errorf ~loc "Float.toInt expects one argument")
-      | Ir.BDictMake -> unary (fun _context _loc _args -> VBuilder (ref []))
+      | Ir.BDictMake ->
+        unary (fun _context _loc _args ->
+            VBuilder (ref Builder_unknown, ref []))
       | Ir.BDictCopy ->
         unary (fun _context loc args ->
             match args with
-            | [VBuilder builder] -> VBuilder (ref !builder)
+            | [VBuilder (kind, builder)] -> VBuilder (ref !kind, ref !builder)
             | [value] ->
               VCode
                 (Exp.apply runtime_expr
@@ -718,8 +1476,11 @@ and eval_ident context loc = function
       | Ir.BDictSet ->
         ternary (fun _context loc args ->
             match args with
-            | [VBuilder builder; key; value] ->
-              let field_name = resolve_builder_field_name ~loc key in
+            | [VBuilder (kind, builder); key; value] ->
+              (match builder_kind_of_key key with
+              | Some Builder_tuple -> kind := Builder_tuple
+              | Some Builder_unknown | None -> ());
+              let field_name = resolve_builder_key ~loc key in
               builder_entries_set builder field_name
                 (runtime_expr_of_value ~loc context value);
               VUnit

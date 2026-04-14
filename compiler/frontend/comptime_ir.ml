@@ -8,8 +8,16 @@ module IdentSet = Set.Make (Ident)
 type builtin =
   | BReflect
   | BFailwith
+  | BFieldType
   | BFieldName
   | BFieldGet
+  | BItemType
+  | BItemIndex
+  | BItemGet
+  | BConstructorPayload
+  | BConstructorName
+  | BConstructorUnpack
+  | BConstructorMake
   | BErase
   | BAdd
   | BConcat
@@ -91,8 +99,20 @@ let builtin_of_path path lid prims =
   | "comptime_dict_copy" :: _ -> Some (IBuiltin (BDictCopy, Some lid))
   | "comptime_dict_set" :: _ -> Some (IBuiltin (BDictSet, Some lid))
   | "comptime_dict_get" :: _ -> Some (IBuiltin (BDictGet, Some lid))
+  | "comptime_field_type" :: _ -> Some (IBuiltin (BFieldType, Some lid))
   | "comptime_field_name" :: _ -> Some (IBuiltin (BFieldName, Some lid))
   | "comptime_field_get" :: _ -> Some (IBuiltin (BFieldGet, Some lid))
+  | "comptime_item_type" :: _ -> Some (IBuiltin (BItemType, Some lid))
+  | "comptime_item_index" :: _ -> Some (IBuiltin (BItemIndex, Some lid))
+  | "comptime_item_get" :: _ -> Some (IBuiltin (BItemGet, Some lid))
+  | "comptime_constructor_payload" :: _ ->
+    Some (IBuiltin (BConstructorPayload, Some lid))
+  | "comptime_constructor_name" :: _ ->
+    Some (IBuiltin (BConstructorName, Some lid))
+  | "comptime_constructor_unpack" :: _ ->
+    Some (IBuiltin (BConstructorUnpack, Some lid))
+  | "comptime_constructor_make" :: _ ->
+    Some (IBuiltin (BConstructorMake, Some lid))
   | "comptime_erase" :: _ -> Some (IBuiltin (BErase, Some lid))
   | _ -> (
     match longident_last lid.txt with
