@@ -46,7 +46,7 @@ let rewrite_signature (ast : Parsetree.signature) : Parsetree.signature =
 let rewrite_implementation (ast : Parsetree.structure) : Parsetree.structure =
   Bs_ast_invariant.iter_warnings_on_stru ast;
   Ast_config.process_str ast;
-  let ast = Comptime_prepass.rewrite ast in
+  let ast = Comptime_surface.rewrite ast in
   let ast =
     match !Js_config.jsx_version with
     | None -> ast

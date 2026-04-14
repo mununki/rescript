@@ -138,6 +138,17 @@ let after_parsing_impl ppf outputprefix (ast : Parsetree.structure) =
           ?check_exists:(if !Js_config.force_cmi then None else Some ())
           !Location.input_name outputprefix modulename env ast
       in
+      let typedtree, coercion =
+        match Comptime_typed.rewrite ~typedtree ast with
+        | None -> (typedtree, coercion)
+        | Some ast ->
+          let typedtree, coercion, _, _ =
+            Typemod.type_implementation_more
+              ?check_exists:(if !Js_config.force_cmi then None else Some ())
+              !Location.input_name outputprefix modulename env ast
+          in
+          (typedtree, coercion)
+      in
       let typedtree_coercion = (typedtree, coercion) in
       print_if ppf Clflags.dump_typedtree
         Printtyped.implementation_with_coercion typedtree_coercion;

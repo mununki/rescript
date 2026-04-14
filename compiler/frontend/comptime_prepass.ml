@@ -8,6 +8,10 @@ open Parsetree
 
 module StringMap = Map.Make (String)
 
+let comptime_splice_field_label = "__rescript_comptime_splice_field__"
+let comptime_splice_rows_label = "__rescript_comptime_splice_rows__"
+let gensym_counter = ref 0
+
 type resolved_type =
   | Type_string
   | Type_int
@@ -32,12 +36,14 @@ type value =
   | VVariant of string * value option
   | VClosure of closure
   | VBuiltin of builtin
+  | VBuilder of (string * expression) list ref
+  | VRecordFields of expression record_element list
   | VCode of expression
 
 and closure = {
   pattern: pattern;
   body: expression;
-  env: value StringMap.t;
+  env: value StringMap.t ref;
   closure_newtypes: core_type StringMap.t;
 }
 
@@ -280,6 +286,17 @@ let substitute_newtypes_in_expr newtypes expr =
   in
   mapper.expr mapper expr
 
+let substitute_newtypes_in_pattern newtypes pat =
+  let mapper =
+    {
+      default_mapper with
+      typ =
+        (fun self ct ->
+          default_mapper.typ self (substitute_newtypes_in_core_type newtypes ct));
+    }
+  in
+  mapper.pat mapper pat
+
 let rec resolve_type context visited (ct : core_type) =
   match ct.ptyp_desc with
   | Ptyp_constr ({txt = Lident "string"; _}, []) -> Type_string
@@ -333,6 +350,30 @@ let rec resolve_type context visited (ct : core_type) =
               "Open types are not supported in comptime reflection")))
   | _ -> errorf ~loc:ct.ptyp_loc "Unsupported type shape in comptime reflection"
 
+let field_constructor_name_of_resolved_type = function
+  | Type_string -> "StringField"
+  | Type_int -> "IntField"
+  | Type_float -> "FloatField"
+  | Type_bool -> "BoolField"
+  | Type_json -> "JsonField"
+  | Type_option _ -> "OptionField"
+  | Type_array _ -> "ArrayField"
+  | Type_record _ -> "RecordField"
+
+let field_get_builtin field_name =
+  VBuiltin
+    {
+      arity = 1;
+      apply =
+        (fun _context loc args ->
+          match args with
+          | [VCode expr] ->
+            VCode (Exp.field expr (Location.mknoloc (Lident field_name)))
+          | _ ->
+            errorf ~loc
+              "Reflected field getter expects a runtime record expression");
+    }
+
 let rec type_desc_value_of_resolved_type resolved =
   match resolved with
   | Type_string -> VVariant ("String", None)
@@ -349,34 +390,15 @@ let rec type_desc_value_of_resolved_type resolved =
       VArray
         (List.map
            (fun field ->
-             let map = StringMap.empty in
-             let map = StringMap.add "name" (VString field.field_name) map in
-             let map =
-               StringMap.add "typ"
-                 (type_desc_value_of_resolved_type field.field_type)
-                 map
+             let payload =
+               VRecord
+                 (StringMap.empty
+                 |> StringMap.add "name" (VString field.field_name)
+                 |> StringMap.add "get" (field_get_builtin field.field_name))
              in
-             let map = StringMap.add "optional" (VBool false) map in
-             let map = StringMap.add "mutable_" (VBool false) map in
-             let map =
-               StringMap.add "get"
-                 (VBuiltin
-                    {
-                      arity = 1;
-                      apply =
-                        (fun _context _loc args ->
-                          match args with
-                          | [VCode expr] ->
-                            VCode
-                              (Exp.field expr
-                                 (Location.mknoloc (Lident field.field_name)))
-                          | _ ->
-                            errorf ~loc:Location.none
-                              "field.get expects a quoted expression");
-                    })
-                 map
-             in
-             VRecord map)
+             VVariant
+               ( field_constructor_name_of_resolved_type field.field_type,
+                 Some payload ))
            fields)
     in
     VVariant
@@ -387,15 +409,133 @@ let rec type_desc_value_of_resolved_type resolved =
              |> StringMap.add "name" (VString name)
              |> StringMap.add "fields" fields_value)) )
 
-let value_to_expr ~loc = function
+let builder_entries_set builder field_name value_expr =
+  let rec loop acc = function
+    | [] -> List.rev ((field_name, value_expr) :: acc)
+    | (name, _) :: rest when name = field_name ->
+      List.rev_append acc ((field_name, value_expr) :: rest)
+    | entry :: rest -> loop (entry :: acc) rest
+  in
+  builder := loop [] !builder
+
+let resolve_builder_field_name ~loc = function
+  | VString field_name -> field_name
+  | VRecord field -> (
+    match StringMap.find_opt "name" field with
+    | Some (VString field_name) -> field_name
+    | _ ->
+      errorf ~loc
+        "Dict.set on a comptime builder expects a compile-time string or \
+         reflected field descriptor")
+  | VVariant (_, Some (VRecord field)) -> (
+    match StringMap.find_opt "name" field with
+    | Some (VString field_name) -> field_name
+    | _ ->
+      errorf ~loc
+        "Dict.set on a comptime builder expects a compile-time string or \
+         reflected field descriptor")
+  | _ ->
+    errorf ~loc
+      "Dict.set on a comptime builder expects a compile-time string or \
+       reflected field descriptor"
+
+let expected_type_of_some_payload = function
+  | {ptyp_desc = Ptyp_constr ({txt = Lident "option"; _}, [inner]); _} ->
+    Some inner
+  | _ -> None
+
+let rec expr_of_value ~loc ?expected_type context = function
   | VUnit -> Exp.construct ~loc (lid "()") None
   | VInt i -> exp_int i
   | VFloat f -> exp_float f
   | VString s -> exp_string s
   | VBool b -> exp_bool b
+  | VVariant ("None", None) -> exp_none ()
+  | VVariant ("Some", Some value) ->
+    let payload_expected =
+      match expected_type with
+      | Some expected -> expected_type_of_some_payload expected
+      | None -> None
+    in
+    exp_some (expr_of_value ~loc ?expected_type:payload_expected context value)
   | VCode expr -> expr
+  | VBuilder builder -> (
+    let entries = !builder in
+    match expected_type with
+    | Some expected -> (
+      match resolve_type context [] expected with
+      | Type_record (_name, fields) ->
+        let find_entry field_name =
+          List.find_opt (fun (name, _) -> name = field_name) entries
+        in
+        let rows =
+          List.map
+            (fun field ->
+              match find_entry field.field_name with
+              | Some (_, expr) ->
+                {
+                  lid = Location.mknoloc (Lident field.field_name);
+                  x = expr;
+                  opt = false;
+                }
+              | None ->
+                errorf ~loc "Missing field `%s` in comptime record construction"
+                  field.field_name)
+            fields
+        in
+        Exp.record rows None
+      | _ ->
+        let tuple_entries =
+          List.map
+            (fun (name, expr) -> Exp.tuple [exp_string name; expr])
+            entries
+        in
+        Exp.apply
+          (Exp.ident (Location.mknoloc (Ldot (Lident "Dict", "fromArray"))))
+          [(Nolabel, Exp.array tuple_entries)])
+    | None ->
+      let tuple_entries =
+        List.map (fun (name, expr) -> Exp.tuple [exp_string name; expr]) entries
+      in
+      Exp.apply
+        (Exp.ident (Location.mknoloc (Ldot (Lident "Dict", "fromArray"))))
+        [(Nolabel, Exp.array tuple_entries)])
   | _ ->
     errorf ~loc "Expected a comptime value that can be reified as an expression"
+
+let value_to_expr ~loc context value = expr_of_value ~loc context value
+
+let value_to_expr_with_expected ~loc context expected_type value =
+  expr_of_value ~loc ~expected_type context value
+
+let expected_function_codomain = function
+  | Some {ptyp_desc = Ptyp_arrow {ret; _}; _} -> Some ret
+  | _ -> None
+
+let value_to_statement_expr ~loc context = function
+  | VUnit | VBuilder _ -> None
+  | value -> Some (expr_of_value ~loc context value)
+
+let rec value_is_runtime = function
+  | VCode _ -> true
+  | VArray values | VTuple values -> List.exists value_is_runtime values
+  | VVariant (_, Some value) -> value_is_runtime value
+  | _ -> false
+
+let runtime_expr_of_value ~loc context = function
+  | VCode expr -> expr
+  | value -> expr_of_value ~loc context value
+
+let value_to_pattern_runtime_name ~loc = function
+  | VString name -> Pat.var (Location.mknoloc name)
+  | _ ->
+    errorf ~loc
+      "Comptime-generated runtime pattern binders must be compile-time strings"
+
+let runtime_ident_or_binding_name expr =
+  match expr.pexp_desc with
+  | Pexp_ident {txt = Lident name; _} -> Some name
+  | _ -> None
 
 let rec match_pattern ~loc pat value =
   match (pat.ppat_desc, value) with
@@ -445,9 +585,127 @@ and merge_envs left right =
   | Some right ->
     Some (StringMap.union (fun _ _ value -> Some value) left right)
 
+let fresh_runtime_name base =
+  incr gensym_counter;
+  base ^ "$comptime" ^ string_of_int !gensym_counter
+
+let rec rename_runtime_pattern_bindings pat =
+  match pat.ppat_desc with
+  | Ppat_var {txt; loc} ->
+    let fresh = fresh_runtime_name txt in
+    ( StringMap.singleton txt (VCode (exp_ident fresh)),
+      {pat with ppat_desc = Ppat_var {txt = fresh; loc}} )
+  | Ppat_constraint (inner, ct) ->
+    let env, inner = rename_runtime_pattern_bindings inner in
+    (env, {pat with ppat_desc = Ppat_constraint (inner, ct)})
+  | Ppat_alias (inner, alias) ->
+    let env, inner = rename_runtime_pattern_bindings inner in
+    let fresh = fresh_runtime_name alias.txt in
+    let env = StringMap.add alias.txt (VCode (exp_ident fresh)) env in
+    (env, {pat with ppat_desc = Ppat_alias (inner, {alias with txt = fresh})})
+  | Ppat_tuple pats ->
+    let env, pats =
+      List.fold_right
+        (fun pat (env, pats) ->
+          let env_pat, pat = rename_runtime_pattern_bindings pat in
+          ( StringMap.union (fun _ value _ -> Some value) env_pat env,
+            pat :: pats ))
+        pats (StringMap.empty, [])
+    in
+    (env, {pat with ppat_desc = Ppat_tuple pats})
+  | Ppat_record (fields, closed) ->
+    let env, fields =
+      List.fold_right
+        (fun field (env, fields) ->
+          let env_field, pat = rename_runtime_pattern_bindings field.x in
+          ( StringMap.union (fun _ value _ -> Some value) env_field env,
+            {field with x = pat} :: fields ))
+        fields (StringMap.empty, [])
+    in
+    (env, {pat with ppat_desc = Ppat_record (fields, closed)})
+  | Ppat_construct (lid, arg) ->
+    let env, arg =
+      match arg with
+      | None -> (StringMap.empty, None)
+      | Some pat ->
+        let env, pat = rename_runtime_pattern_bindings pat in
+        (env, Some pat)
+    in
+    (env, {pat with ppat_desc = Ppat_construct (lid, arg)})
+  | _ -> (StringMap.empty, pat)
+
 let builtin arity fn = VBuiltin {arity; apply = fn}
 
-let rec eval context env expr =
+let build_recursive_env context env bindings =
+  let rec_env = ref env in
+  let recursive_bindings =
+    List.fold_left
+      (fun acc binding ->
+        match
+          (binding_name_from_pattern binding.pvb_pat, binding.pvb_expr.pexp_desc)
+        with
+        | Some name, Pexp_fun {default; lhs = pattern; rhs = body; _} ->
+          Option.iter
+            (fun _ ->
+              errorf ~loc:binding.pvb_expr.pexp_loc
+                "Optional arguments are not supported in recursive comptime \
+                 bindings")
+            default;
+          StringMap.add name
+            (VClosure
+               {
+                 pattern;
+                 body;
+                 env = rec_env;
+                 closure_newtypes = context.newtypes;
+               })
+            acc
+        | Some _, _ ->
+          errorf ~loc:binding.pvb_expr.pexp_loc
+            "Recursive comptime bindings must be functions"
+        | None, _ ->
+          errorf ~loc:binding.pvb_pat.ppat_loc
+            "Recursive comptime bindings must use simple variable patterns")
+      StringMap.empty bindings
+  in
+  rec_env :=
+    StringMap.union (fun _ value _ -> Some value) recursive_bindings env;
+  !rec_env
+
+let resolve_spliced_record_field_name ~loc value =
+  match value with
+  | VString field_name -> field_name
+  | VRecord field -> (
+    match StringMap.find_opt "name" field with
+    | Some (VString field_name) -> field_name
+    | _ ->
+      errorf ~loc
+        "%%splice(field) in a record label expects a reflected field descriptor"
+    )
+  | _ ->
+    errorf ~loc
+      "%%splice(field) in a record label expects a reflected field descriptor \
+       or compile-time string"
+
+let resolve_spliced_identifier_name ~loc value =
+  match value with
+  | VString name -> name
+  | _ -> errorf ~loc "%%splice(name) in an identifier position expects a string"
+
+let rec quote_value context env expr =
+  match expr.pexp_desc with
+  | Pexp_record (rows, spread_expr) ->
+    let rows, spread_expr, has_fragment_syntax =
+      quote_record_rows
+        ~map_expr:(quote_expression context env)
+        context env rows spread_expr
+    in
+    if spread_expr = None && (has_fragment_syntax || rows = []) then
+      VRecordFields rows
+    else VCode (Exp.record rows spread_expr)
+  | _ -> VCode (quote_expression context env expr)
+
+and eval context env expr =
   match expr.pexp_desc with
   | Pexp_constant (Pconst_integer (text, _)) -> VInt (int_of_string text)
   | Pexp_constant (Pconst_float (text, _)) -> VFloat (float_of_string text)
@@ -483,10 +741,43 @@ let rec eval context env expr =
         | _ -> errorf ~loc "reflect() expects unit")
   | Pexp_ident {txt = Lident "compileError"; _}
   | Pexp_ident {txt = Ldot (Lident "Comptime", "compileError"); _} ->
+    builtin 1 (fun _context loc _args ->
+        errorf ~loc
+          "`compileError` has been removed from the public comptime surface; \
+           use `failwith` or an assertion failure instead")
+  | Pexp_ident {txt = Lident "failwith"; _} ->
     builtin 1 (fun _context loc args ->
         match args with
         | [VString message] -> errorf ~loc "%s" message
-        | _ -> errorf ~loc "compileError expects a string")
+        | _ -> errorf ~loc "failwith expects a string")
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "__fieldName"); _} ->
+    builtin 1 (fun _context loc args ->
+        match args with
+        | [VVariant (_, Some (VRecord field))] -> (
+          match StringMap.find_opt "name" field with
+          | Some (VString name) -> VString name
+          | _ ->
+            errorf ~loc
+              "__fieldName expects a reflected field descriptor payload")
+        | _ -> errorf ~loc "__fieldName expects a reflected field descriptor")
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "__fieldGet"); _} ->
+    builtin 2 (fun _context loc args ->
+        match args with
+        | [VVariant (_, Some (VRecord field)); VCode expr] -> (
+          match StringMap.find_opt "name" field with
+          | Some (VString name) ->
+            VCode (Exp.field expr (Location.mknoloc (Lident name)))
+          | _ ->
+            errorf ~loc
+              "__fieldGet expects a reflected field descriptor payload")
+        | _ ->
+          errorf ~loc
+            "__fieldGet expects a reflected field descriptor and runtime value")
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "__erase"); _} ->
+    builtin 1 (fun _context loc args ->
+        match args with
+        | [value] -> value
+        | _ -> errorf ~loc "__erase expects a single argument")
   | Pexp_ident {txt = Lident "+"; _} ->
     builtin 2 (fun _context loc args ->
         match args with
@@ -497,76 +788,20 @@ let rec eval context env expr =
         match args with
         | [VString left; VString right] -> VString (left ^ right)
         | _ -> errorf ~loc "`++` expects two strings during comptime evaluation")
-  | Pexp_ident {txt = Ldot (Lident "Code", "dict"); _} ->
-    builtin 1 (fun _context loc args ->
-        match args with
-        | [VArray rows] ->
-          let entries =
-            List.map
-              (function
-                | VTuple [VString key; VCode value] ->
-                  Exp.tuple [exp_string key; value]
-                | _ ->
-                  errorf ~loc
-                    "Code.dict expects an array of (string, quotedExpression) \
-                     pairs")
-              rows
-          in
-          VCode
-            (Exp.apply
-               (Exp.ident
-                  (Location.mknoloc (Ldot (Lident "Primitive_dict", "make"))))
-               [(Nolabel, Exp.array entries)])
-        | _ -> errorf ~loc "Code.dict expects a single array argument")
-  | Pexp_ident {txt = Ldot (Lident "Code", "recordOption"); _} ->
-    builtin 2 (fun _context loc args ->
-        match args with
-        | [VString _name; VArray rows] ->
-          let names_and_codes =
-            List.mapi
-              (fun index row ->
-                match row with
-                | VTuple [VString field_name; VCode code] ->
-                  (field_name, code, "field_" ^ string_of_int index)
-                | _ ->
-                  errorf ~loc
-                    "Code.recordOption expects an array of (string, \
-                     quotedExpression) pairs")
-              rows
-          in
-          let tuple_expr =
-            Exp.tuple (List.map (fun (_, code, _) -> code) names_and_codes)
-          in
-          let success_pattern =
-            Pat.tuple
-              (List.map
-                 (fun (_, _, var_name) -> pat_some (pat_var var_name))
-                 names_and_codes)
-          in
-          let success_record =
-            Exp.record
-              (List.map
-                 (fun (field_name, _, var_name) ->
-                   {
-                     lid = Location.mknoloc (Lident field_name);
-                     x = exp_ident var_name;
-                     opt = false;
-                   })
-                 names_and_codes)
-              None
-          in
-          let success_case =
-            Exp.case success_pattern (exp_some success_record)
-          in
-          let fallback_case = Exp.case (pat_any ()) (exp_none ()) in
-          VCode (Exp.match_ tuple_expr [success_case; fallback_case])
-        | _ -> errorf ~loc "Code.recordOption expects two arguments")
   | Pexp_ident {txt = Ldot (Lident "Array", "map"); _} ->
     builtin 2 (fun context loc args ->
         match args with
         | [VArray values; fn] ->
           VArray (List.map (fun value -> apply context ~loc fn [value]) values)
         | _ -> errorf ~loc "Array.map expects an array and a function")
+  | Pexp_ident {txt = Ldot (Lident "Array", "get"); _} ->
+    builtin 2 (fun _context loc args ->
+        match args with
+        | [VArray values; VInt index] ->
+          if index < 0 || index >= List.length values then
+            VVariant ("None", None)
+          else VVariant ("Some", Some (List.nth values index))
+        | _ -> errorf ~loc "Array.get expects an array and an int")
   | Pexp_ident {txt = Ldot (Lident "Int", "toFloat"); _} ->
     builtin 1 (fun _context loc args ->
         match args with
@@ -587,7 +822,7 @@ let rec eval context env expr =
         errorf ~loc:expr.pexp_loc
           "Optional arguments are not supported in comptime evaluation")
       default;
-    VClosure {pattern; body; env; closure_newtypes = context.newtypes}
+    VClosure {pattern; body; env = ref env; closure_newtypes = context.newtypes}
   | Pexp_apply {funct = fn; args; _} ->
     let fn = eval context env fn in
     let args = List.map (fun (_, arg) -> eval context env arg) args in
@@ -608,6 +843,9 @@ let rec eval context env expr =
         env bindings
     in
     eval context env body
+  | Pexp_let (Recursive, bindings, body) ->
+    let env = build_recursive_env context env bindings in
+    eval context env body
   | Pexp_match (scrutinee, cases) ->
     let scrutinee = eval context env scrutinee in
     eval_case_list context env expr.pexp_loc scrutinee cases
@@ -621,6 +859,15 @@ let rec eval context env expr =
     | _ ->
       errorf ~loc:condition.pexp_loc
         "if conditions in comptime evaluation must be booleans")
+  | Pexp_assert asserted -> (
+    match eval context env asserted with
+    | VBool true -> VUnit
+    | VBool false ->
+      errorf ~loc:asserted.pexp_loc
+        "Assertion failed during comptime evaluation"
+    | _ ->
+      errorf ~loc:asserted.pexp_loc
+        "assert expects a boolean during comptime evaluation")
   | Pexp_field (record_expr, {txt; loc}) -> (
     match (eval context env record_expr, txt) with
     | VRecord record, Lident label -> (
@@ -630,9 +877,10 @@ let rec eval context env expr =
     | _ ->
       errorf ~loc
         "Field access in comptime evaluation expects a reflected record value")
-  | Pexp_extension ({txt = "quote"; loc; _}, payload) ->
-    let quoted = expr_payload_single ~loc payload in
-    VCode (quote_expression context env quoted)
+  | Pexp_extension ({txt = "quote"; loc; _}, _) ->
+    errorf ~loc "`%%quote` has been removed from the public comptime surface"
+  | Pexp_extension ({txt = "splice"; loc; _}, _) ->
+    errorf ~loc "`%%splice` has been removed from the public comptime surface"
   | _ ->
     errorf ~loc:expr.pexp_loc "Unsupported expression in comptime evaluation"
 
@@ -656,7 +904,7 @@ and apply context ~loc fn args =
       | None -> errorf ~loc "Failed to apply comptime function"
       | Some bindings ->
         let env =
-          StringMap.union (fun _ value _ -> Some value) bindings closure.env
+          StringMap.union (fun _ value _ -> Some value) bindings !(closure.env)
         in
         eval {context with newtypes = closure.closure_newtypes} env closure.body
       )
@@ -685,6 +933,515 @@ and eval_case_list context env loc scrutinee cases =
       in
       if guard_ok then eval context env case.pc_rhs
       else eval_case_list context env loc scrutinee rest)
+
+and stage_expression context env ?expected_type expr =
+  match expr.pexp_desc with
+  | Pexp_constant _ -> eval context env expr
+  | Pexp_construct ({txt = Lident "()"; _}, None) -> VUnit
+  | Pexp_construct ({txt = Lident "true"; _}, None) -> VBool true
+  | Pexp_construct ({txt = Lident "false"; _}, None) -> VBool false
+  | Pexp_construct ({txt = Lident "None"; _}, None) -> VVariant ("None", None)
+  | Pexp_construct (({txt = Lident "Some"; _} as ctor), Some payload) ->
+    let payload_expected =
+      Option.bind expected_type expected_type_of_some_payload
+    in
+    let payload_value =
+      stage_expression context env ?expected_type:payload_expected payload
+    in
+    if value_is_runtime payload_value then
+      VCode
+        (Exp.construct ctor
+           (Some
+              (expr_of_value ~loc:payload.pexp_loc
+                 ?expected_type:payload_expected context payload_value)))
+    else VVariant ("Some", Some payload_value)
+  | Pexp_construct (ctor, Some payload) ->
+    let payload_value = stage_expression context env payload in
+    if
+      value_is_runtime payload_value
+      ||
+      match payload_value with
+      | VBuilder _ -> true
+      | _ -> false
+    then
+      VCode
+        (Exp.construct ctor
+           (Some
+              (runtime_expr_of_value ~loc:payload.pexp_loc context payload_value)))
+    else eval context env expr
+  | Pexp_construct (_, None) -> eval context env expr
+  | Pexp_tuple exprs ->
+    let values =
+      List.map (fun expr -> stage_expression context env expr) exprs
+    in
+    if List.exists value_is_runtime values then
+      VCode
+        (Exp.tuple
+           (List.map (runtime_expr_of_value ~loc:expr.pexp_loc context) values))
+    else VTuple values
+  | Pexp_array exprs ->
+    let values =
+      List.map (fun expr -> stage_expression context env expr) exprs
+    in
+    if List.exists value_is_runtime values then
+      VCode
+        (Exp.array
+           (List.map (runtime_expr_of_value ~loc:expr.pexp_loc context) values))
+    else VArray values
+  | Pexp_constraint (inner, _) ->
+    stage_expression context env ?expected_type inner
+  | Pexp_newtype (name, inner) ->
+    let newtypes =
+      match context.target_type with
+      | Some target -> StringMap.add name.txt target context.newtypes
+      | None -> context.newtypes
+    in
+    stage_expression {context with newtypes} env ?expected_type inner
+  | Pexp_ident {txt = Lident name; _} -> (
+    match StringMap.find_opt name env with
+    | Some value -> value
+    | None -> (
+      match StringMap.find_opt name context.bindings with
+      | Some binding -> eval context StringMap.empty binding.expression
+      | None -> VCode expr))
+  | Pexp_field (record_expr, ({txt; loc} as field_lid)) -> (
+    match stage_expression context env record_expr with
+    | VRecord record -> (
+      match txt with
+      | Lident label -> (
+        match StringMap.find_opt label record with
+        | Some value -> value
+        | None -> errorf ~loc "Unknown comptime field `%s`" label)
+      | _ ->
+        errorf ~loc
+          "Field access in comptime evaluation expects an identifier field")
+    | VCode record_expr -> VCode (Exp.field record_expr field_lid)
+    | _ ->
+      errorf ~loc
+        "Field access in comptime staging expects a reflected record or \
+         runtime expression")
+  | Pexp_fun {default; lhs = pattern; rhs = body; _} ->
+    Option.iter
+      (fun _ ->
+        errorf ~loc:expr.pexp_loc
+          "Optional arguments are not supported in comptime evaluation")
+      default;
+    VClosure {pattern; body; env = ref env; closure_newtypes = context.newtypes}
+  | Pexp_let (Nonrecursive, bindings, body) ->
+    stage_let context env ?expected_type expr.pexp_loc bindings body
+  | Pexp_let (Recursive, bindings, body) ->
+    let env = build_recursive_env context env bindings in
+    stage_expression context env ?expected_type body
+  | Pexp_sequence (left, right) ->
+    let left_value = stage_expression context env left in
+    let right_value = stage_expression context env ?expected_type right in
+    stage_sequence context expr.pexp_loc left_value right_value
+  | Pexp_ifthenelse (condition, when_true, when_false) ->
+    let condition_value = stage_expression context env condition in
+    stage_ifthenelse context env ?expected_type expr.pexp_loc condition_value
+      when_true when_false
+  | Pexp_match (scrutinee, cases) ->
+    let scrutinee_value = stage_expression context env scrutinee in
+    stage_match context env ?expected_type expr.pexp_loc scrutinee_value cases
+  | Pexp_assert asserted -> (
+    match stage_expression context env asserted with
+    | VBool true -> VUnit
+    | VBool false ->
+      errorf ~loc:asserted.pexp_loc
+        "Assertion failed during comptime evaluation"
+    | VCode asserted_code -> VCode (Exp.assert_ asserted_code)
+    | _ ->
+      errorf ~loc:asserted.pexp_loc
+        "assert expects a boolean during comptime evaluation")
+  | Pexp_apply {funct = fn; args; _} ->
+    stage_apply context env ?expected_type expr.pexp_loc fn args
+  | Pexp_extension ({txt = "quote"; loc; _}, _) ->
+    errorf ~loc "`%%quote` has been removed from the public comptime surface"
+  | Pexp_extension ({txt = "splice"; loc; _}, _) ->
+    errorf ~loc "`%%splice` has been removed from the public comptime surface"
+  | _ -> VCode (quote_expression context env expr)
+
+and stage_let context env ?expected_type _loc bindings body =
+  let env, runtime_bindings =
+    List.fold_left
+      (fun (env, runtime_bindings) binding ->
+        let value = stage_expression context env binding.pvb_expr in
+        match
+          (binding_name_from_pattern binding.pvb_pat, value_is_runtime value)
+        with
+        | Some name, false ->
+          let env = StringMap.add name value env in
+          (env, runtime_bindings)
+        | Some name, true ->
+          let runtime_expr =
+            runtime_expr_of_value ~loc:binding.pvb_expr.pexp_loc context value
+          in
+          let env = StringMap.add name (VCode (exp_ident name)) env in
+          (env, runtime_bindings @ [{binding with pvb_expr = runtime_expr}])
+        | None, false -> (env, runtime_bindings)
+        | None, true ->
+          errorf ~loc:binding.pvb_pat.ppat_loc
+            "Comptime staging only supports runtime let bindings for simple \
+             variable patterns")
+      (env, []) bindings
+  in
+  let body_value = stage_expression context env ?expected_type body in
+  match runtime_bindings with
+  | [] -> body_value
+  | _ ->
+    VCode
+      (Exp.let_ Nonrecursive runtime_bindings
+         (expr_of_value ~loc:body.pexp_loc ?expected_type context body_value))
+
+and stage_sequence context loc left_value right_value =
+  match value_to_statement_expr ~loc context left_value with
+  | None -> right_value
+  | Some left_expr ->
+    let right_expr = runtime_expr_of_value ~loc context right_value in
+    VCode (Exp.sequence left_expr right_expr)
+
+and stage_ifthenelse context env ?expected_type loc condition_value when_true
+    when_false =
+  match condition_value with
+  | VBool true -> stage_expression context env ?expected_type when_true
+  | VBool false -> (
+    match when_false with
+    | Some when_false -> stage_expression context env ?expected_type when_false
+    | None -> VUnit)
+  | _ ->
+    let condition_expr = runtime_expr_of_value ~loc context condition_value in
+    let true_value = stage_expression context env ?expected_type when_true in
+    let false_expr =
+      match when_false with
+      | Some when_false ->
+        expr_of_value ~loc:when_false.pexp_loc ?expected_type context
+          (stage_expression context env ?expected_type when_false)
+      | None -> expr_of_value ~loc context VUnit
+    in
+    VCode
+      (Exp.ifthenelse condition_expr
+         (expr_of_value ~loc:when_true.pexp_loc ?expected_type context
+            true_value)
+         (Some false_expr))
+
+and stage_match context env ?expected_type loc scrutinee_value cases =
+  if not (value_is_runtime scrutinee_value) then
+    let rec select_case = function
+      | [] -> errorf ~loc "Non-exhaustive comptime switch"
+      | case :: rest -> (
+        match
+          match_pattern ~loc:case.pc_lhs.ppat_loc case.pc_lhs scrutinee_value
+        with
+        | None -> select_case rest
+        | Some bindings ->
+          let env =
+            StringMap.union (fun _ value _ -> Some value) bindings env
+          in
+          let guard_ok =
+            match case.pc_guard with
+            | None -> true
+            | Some guard -> (
+              match stage_expression context env guard with
+              | VBool result -> result
+              | _ ->
+                errorf ~loc:guard.pexp_loc
+                  "Comptime guard expressions must evaluate to bool")
+          in
+          if guard_ok then
+            stage_expression context env ?expected_type case.pc_rhs
+          else select_case rest)
+    in
+    select_case cases
+  else
+    let scrutinee_expr = runtime_expr_of_value ~loc context scrutinee_value in
+    let cases =
+      List.map
+        (fun case ->
+          let runtime_bindings, runtime_pattern =
+            rename_runtime_pattern_bindings case.pc_lhs
+          in
+          let case_env =
+            StringMap.union (fun _ value _ -> Some value) runtime_bindings env
+          in
+          let guard =
+            match case.pc_guard with
+            | None -> None
+            | Some guard -> (
+              match stage_expression context case_env guard with
+              | VBool true -> None
+              | VBool false -> Some (Exp.construct (lid "false") None)
+              | value ->
+                Some (runtime_expr_of_value ~loc:guard.pexp_loc context value))
+          in
+          {
+            case with
+            pc_lhs = runtime_pattern;
+            pc_guard = guard;
+            pc_rhs =
+              expr_of_value ~loc:case.pc_rhs.pexp_loc ?expected_type context
+                (stage_expression context case_env ?expected_type case.pc_rhs);
+          })
+        cases
+    in
+    VCode (Exp.match_ scrutinee_expr cases)
+
+and stage_apply context env ?expected_type loc fn args =
+  let stage_arg (_, arg) = stage_expression context env arg in
+  match fn.pexp_desc with
+  | Pexp_ident {txt = Lident "reflect"; _}
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "reflect"); _} ->
+    apply context ~loc (eval context env fn) (List.map stage_arg args)
+  | Pexp_ident {txt = Lident "failwith"; _} ->
+    apply context ~loc (eval context env fn) (List.map stage_arg args)
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "__erase"); _} ->
+    apply context ~loc (eval context env fn) (List.map stage_arg args)
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "__fieldName"); _}
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "__fieldGet"); _} ->
+    apply context ~loc (eval context env fn) (List.map stage_arg args)
+  | Pexp_ident {txt = Lident "+"; _}
+  | Pexp_ident {txt = Lident "++"; _}
+  | Pexp_ident {txt = Ldot (Lident "Array", "get"); _}
+  | Pexp_ident {txt = Ldot (Lident "Array", "forEach"); _}
+  | Pexp_ident {txt = Ldot (Lident "Array", "reduce"); _}
+  | Pexp_ident {txt = Ldot (Lident "Array", "reduceRight"); _}
+  | Pexp_ident {txt = Ldot (Lident "Int", "toFloat"); _}
+  | Pexp_ident {txt = Ldot (Lident "Float", "toInt"); _} ->
+    stage_builtin_application context env ?expected_type loc fn args
+  | Pexp_ident {txt = Ldot (Lident "Dict", "make"); _} -> VBuilder (ref [])
+  | Pexp_ident {txt = Ldot (Lident "Dict", "copy"); _} -> (
+    match List.map stage_arg args with
+    | [VBuilder builder] -> VBuilder (ref !builder)
+    | [value] ->
+      VCode
+        (Exp.apply fn
+           (List.map
+              (fun (label, arg) ->
+                (label, runtime_expr_of_value ~loc:arg.pexp_loc context value))
+              args))
+    | _ -> errorf ~loc "Dict.copy expects one argument")
+  | Pexp_ident {txt = Ldot (Lident "Dict", "set"); _} -> (
+    match List.map stage_arg args with
+    | [VBuilder builder; key; value] ->
+      let field_name = resolve_builder_field_name ~loc key in
+      let value_expr = runtime_expr_of_value ~loc context value in
+      builder_entries_set builder field_name value_expr;
+      VUnit
+    | values ->
+      let arg_exprs =
+        List.map2
+          (fun (label, arg) value ->
+            (label, runtime_expr_of_value ~loc:arg.pexp_loc context value))
+          args values
+      in
+      VCode (Exp.apply fn arg_exprs))
+  | _ ->
+    let fn_value = stage_expression context env fn in
+    let arg_values = List.map stage_arg args in
+    apply_stage context ~loc ?expected_type fn args fn_value arg_values
+
+and stage_builtin_application context env ?expected_type:_ loc fn args =
+  let values =
+    List.map (fun (_, arg) -> stage_expression context env arg) args
+  in
+  let fallback_runtime () =
+    VCode
+      (Exp.apply fn
+         (List.map2
+            (fun (label, arg) value ->
+              (label, runtime_expr_of_value ~loc:arg.pexp_loc context value))
+            args values))
+  in
+  match fn.pexp_desc with
+  | Pexp_ident {txt = Lident "+"; _} -> (
+    match values with
+    | [VInt left; VInt right] -> VInt (left + right)
+    | _ -> fallback_runtime ())
+  | Pexp_ident {txt = Lident "++"; _} -> (
+    match values with
+    | [VString left; VString right] -> VString (left ^ right)
+    | _ -> fallback_runtime ())
+  | Pexp_ident {txt = Ldot (Lident "Array", "get"); _} -> (
+    match values with
+    | [VArray values; VInt index] ->
+      if index < 0 || index >= List.length values then VVariant ("None", None)
+      else VVariant ("Some", Some (List.nth values index))
+    | _ -> fallback_runtime ())
+  | Pexp_ident {txt = Ldot (Lident "Array", "forEach"); _} -> (
+    match values with
+    | [VArray values; ((VClosure _ | VBuiltin _) as fn_value)] ->
+      List.iter
+        (fun value ->
+          ignore
+            (apply_stage context ~loc
+               (exp_ident "__comptime_array_forEach")
+               [(Nolabel, exp_ident "__comptime_forEach_arg")]
+               fn_value [value]))
+        values;
+      VUnit
+    | _ -> fallback_runtime ())
+  | Pexp_ident {txt = Ldot (Lident "Array", "reduce"); _} -> (
+    match values with
+    | [VArray values; init; ((VClosure _ | VBuiltin _) as fn_value)] ->
+      List.fold_left
+        (fun acc value ->
+          apply_stage context ~loc
+            (exp_ident "__comptime_array_reduce")
+            [
+              (Nolabel, exp_ident "__comptime_reduce_acc");
+              (Nolabel, exp_ident "__comptime_reduce_value");
+            ]
+            fn_value [acc; value])
+        init values
+    | _ -> fallback_runtime ())
+  | Pexp_ident {txt = Ldot (Lident "Array", "reduceRight"); _} -> (
+    match values with
+    | [VArray values; init; ((VClosure _ | VBuiltin _) as fn_value)] ->
+      List.fold_right
+        (fun value acc ->
+          apply_stage context ~loc
+            (exp_ident "__comptime_array_reduceRight")
+            [
+              (Nolabel, exp_ident "__comptime_reduceRight_acc");
+              (Nolabel, exp_ident "__comptime_reduceRight_value");
+            ]
+            fn_value [acc; value])
+        values init
+    | _ -> fallback_runtime ())
+  | Pexp_ident {txt = Ldot (Lident "Int", "toFloat"); _} -> (
+    match values with
+    | [VInt value] -> VFloat (float_of_int value)
+    | _ -> fallback_runtime ())
+  | Pexp_ident {txt = Ldot (Lident "Float", "toInt"); _} -> (
+    match values with
+    | [VFloat value] -> VInt (int_of_float value)
+    | _ -> fallback_runtime ())
+  | Pexp_ident {txt = Lident "reflect"; _}
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "reflect"); _} ->
+    apply context ~loc (eval context env fn) values
+  | Pexp_ident {txt = Lident "failwith"; _} ->
+    apply context ~loc (eval context env fn) values
+  | _ -> fallback_runtime ()
+
+and apply_stage context ~loc ?expected_type fn_expr args_exprs fn args =
+  match fn with
+  | VBuiltin builtin ->
+    if List.length args <> builtin.arity then
+      errorf ~loc "Unexpected comptime builtin arity"
+    else builtin.apply context loc args
+  | VClosure closure -> (
+    match args with
+    | [] -> fn
+    | [arg] -> (
+      match match_pattern ~loc closure.pattern arg with
+      | None -> errorf ~loc "Failed to apply comptime function"
+      | Some bindings ->
+        let env =
+          StringMap.union (fun _ value _ -> Some value) bindings !(closure.env)
+        in
+        stage_expression
+          {context with newtypes = closure.closure_newtypes}
+          env ?expected_type closure.body)
+    | arg :: rest ->
+      let partially_applied =
+        apply_stage context ~loc fn_expr args_exprs fn [arg]
+      in
+      apply_stage context ~loc ?expected_type fn_expr args_exprs
+        partially_applied rest)
+  | VCode fn_code ->
+    let arg_exprs =
+      List.map2
+        (fun (label, arg_expr) value ->
+          (label, runtime_expr_of_value ~loc:arg_expr.pexp_loc context value))
+        args_exprs args
+    in
+    VCode (Exp.apply fn_code arg_exprs)
+  | _ ->
+    let fn_expr = runtime_expr_of_value ~loc context fn in
+    let arg_exprs =
+      List.map2
+        (fun (label, arg_expr) value ->
+          (label, runtime_expr_of_value ~loc:arg_expr.pexp_loc context value))
+        args_exprs args
+    in
+    VCode (Exp.apply fn_expr arg_exprs)
+
+and stage_closure_expression context expected_type closure =
+  match expected_type.ptyp_desc with
+  | Ptyp_arrow {ret; _} ->
+    let pattern =
+      substitute_newtypes_in_pattern closure.closure_newtypes closure.pattern
+    in
+    let body_value =
+      stage_expression
+        {context with newtypes = closure.closure_newtypes}
+        !(closure.env) ~expected_type:ret closure.body
+    in
+    Exp.fun_ ~arity:None Nolabel None pattern
+      (expr_of_value ~loc:closure.body.pexp_loc ~expected_type:ret context
+         body_value)
+  | _ ->
+    errorf ~loc:expected_type.ptyp_loc
+      "Expected a function type for a comptime-generated function"
+
+and quote_record_rows ~map_expr context env rows spread_expr =
+  let has_fragment_syntax = ref false in
+  let append_row acc row = acc @ [row] in
+  let rows =
+    List.fold_left
+      (fun acc row ->
+        match row.lid.txt with
+        | Lident field_name when field_name = comptime_splice_rows_label -> (
+          has_fragment_syntax := true;
+          match row.x.pexp_desc with
+          | Pexp_extension ({txt = "splice"; loc; _}, payload) -> (
+            let splice_expr = expr_payload_single ~loc payload in
+            match eval context env splice_expr with
+            | VRecordFields rows -> acc @ rows
+            | _ ->
+              errorf ~loc
+                "%%splice(fields) in a record literal expects record field \
+                 fragments")
+          | _ ->
+            errorf ~loc:row.x.pexp_loc
+              "Record field splices must use %%splice(...)")
+        | Lident field_name when field_name = comptime_splice_field_label -> (
+          has_fragment_syntax := true;
+          match row.x.pexp_desc with
+          | Pexp_tuple [label_expr; value_expr] ->
+            let field_name =
+              match label_expr.pexp_desc with
+              | Pexp_extension ({txt = "splice"; loc; _}, payload) ->
+                let splice_expr = expr_payload_single ~loc payload in
+                let value = eval context env splice_expr in
+                resolve_spliced_record_field_name ~loc value
+              | _ ->
+                errorf ~loc:label_expr.pexp_loc
+                  "Record field label splices must use %%splice(...)"
+            in
+            append_row acc
+              {
+                row with
+                lid = Location.mkloc (Lident field_name) row.lid.loc;
+                x = map_expr value_expr;
+              }
+          | _ ->
+            errorf ~loc:row.x.pexp_loc "Malformed comptime record field splice")
+        | _ -> append_row acc {row with x = map_expr row.x})
+      [] rows
+  in
+  let spread_expr =
+    match spread_expr with
+    | None -> None
+    | Some spread_expr -> (
+      match spread_expr.pexp_desc with
+      | Pexp_extension ({txt = "splice"; loc; _}, payload) -> (
+        let splice_expr = expr_payload_single ~loc payload in
+        match eval context env splice_expr with
+        | VCode expr -> Some (substitute_newtypes_in_expr context.newtypes expr)
+        | _ -> errorf ~loc "Record spread splices expect quoted expressions")
+      | _ -> Some (map_expr spread_expr))
+  in
+  (rows, spread_expr, !has_fragment_syntax)
 
 and quote_expression context env expr =
   let inline_constant expr =
@@ -716,37 +1473,75 @@ and quote_expression context env expr =
       expr =
         (fun self expr ->
           match expr.pexp_desc with
+          | Pexp_record (rows, spread_expr) ->
+            let rows, spread_expr, _ =
+              quote_record_rows ~map_expr:(self.expr self) context env rows
+                spread_expr
+            in
+            {expr with pexp_desc = Pexp_record (rows, spread_expr)}
           | Pexp_extension ({txt = "splice"; loc; _}, payload) ->
             let expr = expr_payload_single ~loc payload in
             let value = eval context env expr in
             let quoted =
               match value with
-              | VCode expr -> expr
-              | _ -> errorf ~loc "%%splice expects a quoted code value"
+              | VCode expr -> substitute_newtypes_in_expr context.newtypes expr
+              | VString name -> Exp.ident (lid name)
+              | VRecordFields _ ->
+                errorf ~loc
+                  "Record field fragments can only be spliced inside record \
+                   literals"
+              | _ ->
+                errorf ~loc
+                  "%%splice expects a quoted code value or identifier name"
             in
-            substitute_newtypes_in_expr context.newtypes quoted
+            quoted
           | _ -> (
             match inline_constant expr with
             | Some constant -> constant
             | None -> default_mapper.expr self expr));
+      pat =
+        (fun self pat ->
+          match pat.ppat_desc with
+          | Ppat_extension ({txt = "splice"; loc; _}, payload) ->
+            let expr = expr_payload_single ~loc payload in
+            let value = eval context env expr in
+            let name = resolve_spliced_identifier_name ~loc value in
+            Pat.var (Location.mknoloc name)
+          | _ -> default_mapper.pat self pat);
       typ =
         (fun self ct ->
           default_mapper.typ self
             (substitute_newtypes_in_core_type context.newtypes ct));
     }
   in
-  mapper.expr mapper expr
+  match expr.pexp_desc with
+  | Pexp_record (rows, spread_expr) ->
+    let rows, spread_expr, _ =
+      quote_record_rows ~map_expr:(mapper.expr mapper) context env rows
+        spread_expr
+    in
+    {expr with pexp_desc = Pexp_record (rows, spread_expr)}
+  | Pexp_extension ({txt = "splice"; loc; _}, payload) -> (
+    let expr = expr_payload_single ~loc payload in
+    let value = eval context env expr in
+    match value with
+    | VCode expr -> substitute_newtypes_in_expr context.newtypes expr
+    | VString name -> Exp.ident (lid name)
+    | VRecordFields _ ->
+      errorf ~loc
+        "Record field fragments can only be spliced inside record literals"
+    | _ -> errorf ~loc "%%splice expects a quoted code value or identifier name"
+    )
+  | _ -> mapper.expr mapper expr
 
 let extract_target_type_from_expected ~loc:_ expected =
   match expected.ptyp_desc with
   | Ptyp_arrow {arg = {typ = domain; _}; ret = codomain; _} -> (
-    match codomain.ptyp_desc with
-    | Ptyp_constr ({txt = Ldot (Lident "JSON", "t"); _}, []) -> Some domain
-    | Ptyp_constr ({txt = Lident "option"; _}, [inner]) -> (
-      match domain.ptyp_desc with
-      | Ptyp_constr ({txt = Ldot (Lident "JSON", "t"); _}, []) -> Some inner
-      | _ -> None)
-    | _ -> None)
+    match (domain.ptyp_desc, codomain.ptyp_desc) with
+    | ( Ptyp_constr ({txt = Ldot (Lident "JSON", "t"); _}, []),
+        Ptyp_constr ({txt = Lident "option"; _}, [inner]) ) ->
+      Some inner
+    | _ -> Some domain)
   | _ -> None
 
 let rewrite_comptime_binding context vb =
@@ -767,7 +1562,17 @@ let rewrite_comptime_binding context vb =
     let expression =
       match value with
       | VCode expression -> expression
-      | value -> value_to_expr ~loc value
+      | VClosure closure -> (
+        match expected_type with
+        | Some expected -> stage_closure_expression context expected closure
+        | None ->
+          errorf ~loc
+            "Comptime-generated functions require a binding type annotation")
+      | value -> (
+        match expected_type with
+        | Some expected ->
+          value_to_expr_with_expected ~loc context expected value
+        | None -> value_to_expr ~loc context value)
     in
     {vb with pvb_expr = expression}
   | _ -> vb

@@ -7,6 +7,9 @@ module ResPrinter = Res_printer
 module Scanner = Res_scanner
 module Parser = Res_parser
 
+let comptime_splice_field_label = "__rescript_comptime_splice_field__"
+let comptime_splice_rows_label = "__rescript_comptime_splice_rows__"
+
 let mk_loc start_loc end_loc =
   Location.{loc_start = start_loc; loc_end = end_loc; loc_ghost = false}
 
@@ -3068,6 +3071,29 @@ and parse_braced_or_record_expr p =
     let expr = parse_record_expr ~start_pos ~spread:(Some spread_expr) [] p in
     Parser.expect Rbrace p;
     expr
+  | Percent -> (
+    match parse_record_expr_row p with
+    | Some first_row -> (
+      match p.Parser.token with
+      | Comma ->
+        Parser.next p;
+        let expr = parse_record_expr ~start_pos [first_row] p in
+        Parser.expect Rbrace p;
+        expr
+      | Rbrace ->
+        Parser.next p;
+        let loc = mk_loc start_pos p.prev_end_pos in
+        Ast_helper.Exp.record ~loc [first_row] None
+      | _ ->
+        let expr = parse_record_expr ~start_pos [first_row] p in
+        Parser.expect Rbrace p;
+        expr)
+    | None ->
+      let expr = parse_expr_block p in
+      Parser.expect Rbrace p;
+      let loc = mk_loc start_pos p.prev_end_pos in
+      let braces = make_braces_attr loc in
+      {expr with pexp_attributes = braces :: expr.pexp_attributes})
   | String s -> (
     let field =
       let loc = mk_loc p.start_pos p.end_pos in
@@ -3382,6 +3408,46 @@ and parse_record_expr_row p :
     | _ -> ()
   in
   match p.Parser.token with
+  | Percent -> (
+    let is_splice_row =
+      Parser.lookahead p (fun state ->
+          let extension = parse_extension state in
+          let extension_name, _ = extension in
+          extension_name.txt = "splice")
+    in
+    if not is_splice_row then None
+    else
+      let extension = parse_extension p in
+      let loc = mk_loc p.start_pos p.prev_end_pos in
+      match p.Parser.token with
+      | Colon ->
+        let field =
+          Location.mkloc (Longident.Lident comptime_splice_field_label) loc
+        in
+        Parser.next p;
+        let optional = parse_optional_label p in
+        let field_expr = parse_expr p in
+        let splice_expr = Ast_helper.Exp.extension ~loc ~attrs extension in
+        let payload = Ast_helper.Exp.tuple ~loc [splice_expr; field_expr] in
+        Some {lid = field; x = payload; opt = optional}
+      | Equal ->
+        let field =
+          Location.mkloc (Longident.Lident comptime_splice_field_label) loc
+        in
+        Parser.err ~start_pos:p.start_pos ~end_pos:p.end_pos p
+          (Diagnostics.message ErrorMessages.record_field_missing_colon);
+        Parser.next p;
+        let optional = parse_optional_label p in
+        let field_expr = parse_expr p in
+        let splice_expr = Ast_helper.Exp.extension ~loc ~attrs extension in
+        let payload = Ast_helper.Exp.tuple ~loc [splice_expr; field_expr] in
+        Some {lid = field; x = payload; opt = optional}
+      | _ ->
+        let field =
+          Location.mkloc (Longident.Lident comptime_splice_rows_label) loc
+        in
+        let splice_expr = Ast_helper.Exp.extension ~loc ~attrs extension in
+        Some {lid = field; x = splice_expr; opt = false})
   | Lident _ | Uident _ -> (
     let start_token = p.token in
     let field = parse_value_path p in

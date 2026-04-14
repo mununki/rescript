@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   ada,
+  copyUser,
   decodeUser,
   encodedAda,
   encodeUser,
@@ -14,11 +15,9 @@ assert.deepEqual(encodedAda, {
   age: 42,
   active: true,
 });
-assert.equal(
-  JSON.stringify(encodeUser(ada)),
-  '{"name":"Ada","age":42,"active":true}',
-);
+assert.deepEqual(encodeUser(ada), encodedAda);
 assert.deepEqual(decodeUser(encodedAda), ada);
+assert.deepEqual(copyUser(ada), ada);
 assert.equal(decodeUser("nope"), undefined);
 
 console.log("comptime test passed");

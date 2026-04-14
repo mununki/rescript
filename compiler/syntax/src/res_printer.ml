@@ -5,6 +5,9 @@ module Token = Res_token
 module Parens = Res_parens
 module ParsetreeViewer = Res_parsetree_viewer
 
+let comptime_splice_field_label = "__rescript_comptime_splice_field__"
+let comptime_splice_rows_label = "__rescript_comptime_splice_rows__"
+
 let default_print_width = 100
 
 type callback_style =
@@ -5611,28 +5614,48 @@ and print_expression_record_row ~state {lid = lbl; x = expr; opt = optional}
   let cmt_loc = {lbl.loc with loc_end = expr.pexp_loc.loc_end} in
   let doc =
     Doc.group
-      (match expr.pexp_desc with
-      | Pexp_ident {txt = Lident key; loc = _keyLoc}
-        when punning_allowed && Longident.last lbl.txt = key ->
-        (* print punned field *)
+      (match (lbl.txt, expr.pexp_desc) with
+      | Lident field_name, Pexp_extension ({txt = "splice"; _}, _)
+        when field_name = comptime_splice_rows_label ->
+        print_expression_with_comments ~state expr cmt_tbl
+      | Lident field_name, Pexp_tuple [splice_expr; value_expr]
+        when field_name = comptime_splice_field_label ->
         Doc.concat
           [
-            print_attributes ~state expr.pexp_attributes cmt_tbl;
-            (if optional then Doc.text "?" else Doc.nil);
-            print_lident_path lbl cmt_tbl;
-          ]
-      | _ ->
-        Doc.concat
-          [
-            print_lident_path lbl cmt_tbl;
+            print_expression_with_comments ~state splice_expr cmt_tbl;
             Doc.text ": ";
             (if optional then Doc.text "?" else Doc.nil);
-            (let doc = print_expression_with_comments ~state expr cmt_tbl in
-             match Parens.expr_record_row_rhs ~optional expr with
+            (let doc =
+               print_expression_with_comments ~state value_expr cmt_tbl
+             in
+             match Parens.expr_record_row_rhs ~optional value_expr with
              | Parens.Parenthesized -> add_parens doc
-             | Braced braces -> print_braces doc expr braces
+             | Braced braces -> print_braces doc value_expr braces
              | Nothing -> doc);
-          ])
+          ]
+      | _ -> (
+        match expr.pexp_desc with
+        | Pexp_ident {txt = Lident key; loc = _keyLoc}
+          when punning_allowed && Longident.last lbl.txt = key ->
+          (* print punned field *)
+          Doc.concat
+            [
+              print_attributes ~state expr.pexp_attributes cmt_tbl;
+              (if optional then Doc.text "?" else Doc.nil);
+              print_lident_path lbl cmt_tbl;
+            ]
+        | _ ->
+          Doc.concat
+            [
+              print_lident_path lbl cmt_tbl;
+              Doc.text ": ";
+              (if optional then Doc.text "?" else Doc.nil);
+              (let doc = print_expression_with_comments ~state expr cmt_tbl in
+               match Parens.expr_record_row_rhs ~optional expr with
+               | Parens.Parenthesized -> add_parens doc
+               | Braced braces -> print_braces doc expr braces
+               | Nothing -> doc);
+            ]))
   in
   print_comments doc cmt_tbl cmt_loc
 

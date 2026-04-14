@@ -1,101 +1,61 @@
 # ReScript Comptime
 
-This document describes a `comptime` proof of concept for ReScript.
+This document describes the current `comptime` proof of concept for ReScript.
 
-The goal is a typed, user-authored compile-time code generation model built around a
-single entry point: `%comptime(...)`.
-
-This is a design note for a small first version. It intentionally keeps the scope
-tight and prefers existing ReScript syntax and type annotations.
-
-## Design Principles
-
-- Existing syntax first
-- An explicit compile-time boundary
-- Typed staged code generation
-- User-authored generators instead of fixed built-ins
-- A deliberately small v1 scope
-
-## User Surface
-
-The proposed public surface is:
+The user surface is intentionally small:
 
 - `%comptime(expr)`
-- `%quote(expr)`
-- `%splice(expr)`
-- `Comptime.reflect()`
-- `Comptime.compileError()`
-- `Comptime.Code.t<'a>`
+- `reflect()`
+- reflected field accessors
+  - `field.name`
+  - `field.typ`
+  - `field.get(value)`
 
-The helper names used below, such as `Code.dict`, `Code.recordOption`, and
-`field.get`, should be read as provisional v1 helper names. They describe the
-intended shape of the API, not final naming.
+## Design Goals
+
+- Existing ReScript syntax first
+- One explicit compile-time boundary: `%comptime(...)`
+- User-authored generators
+- Type-directed reflection from ordinary type annotations
+- As little extra staging syntax as possible
 
 ## Type-Directed Invocation
 
-The call site stays within existing ReScript syntax.
-
-The target type comes from the existing type annotation on the `%comptime(...)`
-binding:
+The call site stays inside existing ReScript syntax.
 
 ```rescript
 open Comptime
 
-let makeJsonEncoder: type t. unit => Code.t<t => JSON.t> = ...
+let makeJsonEncoder: type t. unit => t => JSON.t = ...
 
 let encodeUser: user => JSON.t =
   %comptime(makeJsonEncoder())
 ```
 
-In v1, `%comptime(...)` is restricted to top-level annotated `let` bindings. The
-expected type annotation is what lets `reflect()` know which type is being reflected.
+The binding type annotation determines the reflected target type.
 
-## Staging Semantics
+Current rule:
 
-`%quote` and `%splice` are the core staging operators.
+- for `t => ...`, the reflected type is the function domain
+- for `JSON.t => option<t>`, the reflected type is the inner `t`
 
-- `%quote(expr)` turns code into a code value
-- `%splice(code)` inserts a code value into a larger quoted expression
-- `%comptime(expr)` runs the generator at compile time and replaces the call site
-  with the resulting expression
-
-A minimal example:
-
-```rescript
-open Comptime
-
-let makeAddOne: unit => Code.t<int => int> = () =>
-  %quote((x: int) => x + 1)
-
-let addOne: int => int =
-  %comptime(makeAddOne())
-```
-
-Conceptually, the compiler rewrites that to:
-
-```rescript
-let addOne = (x: int) => x + 1
-```
+`%comptime(...)` is currently restricted to top-level annotated `let` bindings.
 
 ## Reflection Model
 
-`reflect()` takes no explicit argument. It reflects the current locally abstract type
-in scope.
-
-For a generator like:
+`reflect()` takes no explicit argument. It reflects the current locally abstract
+type in scope.
 
 ```rescript
 open Comptime
 
-let makeJsonEncoder: type t. unit => Code.t<t => JSON.t> = () => {
+let makeJsonEncoder: type t. unit => t => JSON.t = () => {
   let desc = reflect()
   ...
 }
 ```
 
-`reflect()` returns a descriptor for `t`.
-
-The v1 descriptor space is intentionally small:
+The descriptor space is intentionally small:
 
 - `String`
 - `Int`
@@ -105,7 +65,7 @@ The v1 descriptor space is intentionally small:
 - `Array(desc)`
 - `Record({name, fields})`
 
-The v1 reflection target space is also intentionally small:
+Current reflection target support:
 
 - same-module named records
 - no generics
@@ -113,30 +73,50 @@ The v1 reflection target space is also intentionally small:
 - no recursive types
 - no cross-module reflection
 
+Each reflected record field exposes:
+
+- `field.name`
+- `field.typ`
+- `field.get(value)`
+
+`field.get(value)` means “generate a field access on the runtime value `value`”.
+
 ## Compile-Time Evaluation Model
 
-The compile-time evaluator accepts a restricted pure subset.
+The current implementation uses a typed comptime phase after the first
+typecheck. The important semantic point is:
 
-Supported in v1:
+- control flow over reflected data runs at compile time
+- ordinary runtime syntax returned from `%comptime(...)` remains runtime code
+
+Supported in the current PoC:
 
 - literals
-- top-level pure helper calls in the same module
+- same-module helper calls
+- local recursive helper functions
 - `if` / `switch`
-- traversal over reflection results
-- `%quote` / `%splice`
+- `Array.forEach`
+- `Array.reduce`
+- `Array.reduceRight`
+- `failwith("...")`
+- assertion failures
 
-Not supported in v1:
+`failwith("...")`, assertion failures, and non-exhaustive compile-time matches
+become compile-time diagnostics.
+
+Not supported:
 
 - JS interop
-- mutation
-- arbitrary external calls
-- unrestricted cross-module execution
+- unrestricted external calls
+- arbitrary mutation
 - structure or signature splicing
-- `.resi` support
+- `.resi`
 
-## Sample: JSON Encoder and Decoder
+## Ordinary Generator Syntax
 
-The following is the canonical single-record example:
+Generators are written as ordinary ReScript functions.
+
+For JSON encoding:
 
 ```rescript
 open Comptime
@@ -147,189 +127,180 @@ type user = {
   active: bool,
 }
 
-let makeJsonEncoder: type t. unit => Code.t<t => JSON.t> = () => {
-  let desc = reflect()
-
-  switch desc {
+let makeJsonEncoder: type t. unit => t => JSON.t = () => {
+  switch reflect() {
   | Record({fields}) =>
-    let rows =
-      Array.map(fields, field =>
-        switch field.typ {
-        | String =>
-          (
-            field.name,
-            %quote(JSON.String(%splice(field.get(%quote(value))))),
-          )
-        | Int =>
-          (
-            field.name,
-            %quote(JSON.Number(Int.toFloat(%splice(field.get(%quote(value)))))),
-          )
-        | Bool =>
-          (
-            field.name,
-            %quote(JSON.Boolean(%splice(field.get(%quote(value))))),
-          )
-        | _ =>
-          compileError("makeJsonEncoder only supports string, int, and bool fields")
-        }
-      )
-
-    %quote((value: t) => JSON.Object(%splice(Code.dict(rows))))
-  | _ =>
-    compileError("makeJsonEncoder only supports record types")
-  }
-}
-
-let makeJsonDecoder: type t. unit => Code.t<JSON.t => option<t>> = () => {
-  let desc = reflect()
-
-  switch desc {
-  | Record({name, fields}) =>
-    let decodedFields =
-      Array.map(fields, field =>
-        (
-          field.name,
-          switch field.typ {
-          | String =>
-            %quote(
-              switch Dict.get(obj, field.name) {
-              | Some(JSON.String(value)) => Some(value)
-              | _ => None
-              }
-            )
-          | Int =>
-            %quote(
-              switch Dict.get(obj, field.name) {
-              | Some(JSON.Number(value)) => Some(Float.toInt(value))
-              | _ => None
-              }
-            )
-          | Bool =>
-            %quote(
-              switch Dict.get(obj, field.name) {
-              | Some(JSON.Boolean(value)) => Some(value)
-              | _ => None
-              }
-            )
-          | _ =>
-            compileError("makeJsonDecoder only supports string, int, and bool fields")
-          },
-        )
-      )
-
-    %quote((json: JSON.t) =>
-      switch json {
-      | JSON.Object(obj) => %splice(Code.recordOption(name, decodedFields))
-      | _ => None
+    let encodeField = (field, value) =>
+      switch field.typ {
+      | String => JSON.String(field.get(value))
+      | Int => JSON.Number(Int.toFloat(field.get(value)))
+      | Bool => JSON.Boolean(field.get(value))
+      | _ => failwith("makeJsonEncoder only supports string, int, and bool fields")
       }
-    )
-  | _ =>
-    compileError("makeJsonDecoder only supports record types")
+
+    (value: t) => {
+      let builder =
+        fields->Array.reduce(Dict.make(), (builder, field) => {
+          let nextBuilder = Dict.copy(builder)
+          Dict.set(nextBuilder, field.name, encodeField(field, value))
+          nextBuilder
+        })
+
+      JSON.Object(builder)
+    }
+  | _ => failwith("makeJsonEncoder only supports record types")
   }
 }
-
-let encodeUser: user => JSON.t =
-  %comptime(makeJsonEncoder())
-
-let decodeUser: JSON.t => option<user> =
-  %comptime(makeJsonDecoder())
 ```
 
-This example shows the intended user model:
+For JSON decoding:
 
-- generators are written as ordinary top-level ReScript helpers
-- the target type comes from the `%comptime(...)` binding annotation
-- `reflect()` exposes the structure of that type
-- `%quote` builds code
-- `%splice` combines smaller generated fragments into larger ones
+```rescript
+open Comptime
+
+let makeJsonDecoder: type t. unit => JSON.t => option<t> = () => {
+  switch reflect() {
+  | Record({fields}) =>
+    let decodeField = (field, obj) =>
+      switch field.typ {
+      | String =>
+        switch Dict.get(obj, field.name) {
+        | Some(JSON.String(value)) => Some(value)
+        | _ => None
+        }
+      | Int =>
+        switch Dict.get(obj, field.name) {
+        | Some(JSON.Number(value)) => Some(Float.toInt(value))
+        | _ => None
+        }
+      | Bool =>
+        switch Dict.get(obj, field.name) {
+        | Some(JSON.Boolean(value)) => Some(value)
+        | _ => None
+        }
+      | _ => failwith("makeJsonDecoder only supports string, int, and bool fields")
+      }
+
+    let finish = (_obj, builder) => Some(builder)
+
+    let addDecodedField = (next, field) => (obj, builder) =>
+      switch decodeField(field, obj) {
+      | Some(value) =>
+        let nextBuilder = Dict.copy(builder)
+        Dict.set(nextBuilder, field.name, value)
+        next(obj, nextBuilder)
+      | None => None
+      }
+
+    let decodeObject = fields->Array.reduceRight(finish, addDecodedField)
+
+    (json: JSON.t) =>
+      switch json {
+      | JSON.Object(obj) => decodeObject(obj, Dict.make())
+      | _ => None
+      }
+  | _ => failwith("makeJsonDecoder only supports record types")
+  }
+}
+```
+
+And a non-JSON example:
+
+```rescript
+open Comptime
+
+let makeRecordCopy: type t. unit => t => t = () => {
+  switch reflect() {
+  | Record({fields}) =>
+    (value: t) =>
+      fields->Array.reduce(Dict.make(), (builder, field) => {
+        let nextBuilder = Dict.copy(builder)
+        Dict.set(nextBuilder, field.name, field.get(value))
+        nextBuilder
+      })
+  | _ => failwith("makeRecordCopy only supports record types")
+  }
+}
+```
+
+Call sites:
+
+```rescript
+let encodeUser: user => JSON.t = %comptime(makeJsonEncoder())
+let decodeUser: JSON.t => option<user> = %comptime(makeJsonDecoder())
+let copyUser: user => user = %comptime(makeRecordCopy())
+```
 
 ## Conceptual Expansion
 
-Conceptually, the encoder example expands to ordinary ReScript code like this:
+Conceptually, the encoder above becomes ordinary code like:
 
 ```rescript
 let encodeUser = (value: user) =>
-  JSON.Object(dict{
-    "name": JSON.String(value.name),
-    "age": JSON.Number(Int.toFloat(value.age)),
-    "active": JSON.Boolean(value.active),
-  })
+  JSON.Object(
+    Dict.fromArray([
+      ("name", value.name),
+      ("age", value.age),
+      ("active", value.active),
+    ]),
+  )
 ```
 
-And the decoder example expands to code like this:
+The decoder becomes ordinary code like:
 
 ```rescript
 let decodeUser = (json: JSON.t) =>
   switch json {
   | JSON.Object(obj) =>
-    switch (
-      Dict.get(obj, "name"),
-      Dict.get(obj, "age"),
-      Dict.get(obj, "active"),
-    ) {
-    | (Some(JSON.String(name)), Some(JSON.Number(age)), Some(JSON.Boolean(active))) =>
-      Some({name, age: Float.toInt(age), active})
-    | _ =>
-      None
+    switch Dict.get(obj, "name") {
+    | Some(JSON.String(name)) =>
+      switch Dict.get(obj, "age") {
+      | Some(JSON.Number(age)) =>
+        switch Dict.get(obj, "active") {
+        | Some(JSON.Boolean(active)) => Some({name, age: Float.toInt(age), active})
+        | _ => None
+        }
+      | _ => None
+      }
+    | _ => None
     }
-  | _ =>
-    None
+  | _ => None
   }
 ```
 
-These are conceptual expansions. The exact generated AST printer output is not part
-of this document.
+And `makeRecordCopy` becomes a plain record copy function.
 
-## Compiler Pipeline Sketch
+## Current Implementation Notes
 
-The v1 pipeline is:
+The current implementation uses a typed lowering and evaluator after the first
+typecheck. That means the current system is already useful for:
 
-1. Parse the source file.
-2. Preserve `%comptime`, `%quote`, and `%splice` through parsing.
-3. Resolve the annotated call-site type.
-4. Run the compile-time generator.
-5. Splice the generated expression back into the program.
-6. Typecheck the final rewritten program.
-
-## V1 Scope and Non-Goals
-
-The first version is intentionally limited.
-
-- top-level annotated `let` bindings only
-- expression rewriting only
-- no `.resi` support
-- no structure or signature splicing
-- no new call-site syntax for selecting target types
-- no unrestricted compile-time module execution
+- compile-time constant evaluation
+- ordinary record-driven code generation
+- removing user-authored generator helpers from runtime output
 
 ## Comparison with Zig
 
-This design is inspired by Zig's `comptime`, but it is not trying to match Zig's
-full execution model in v1.
+Zig is a useful reference point because its `comptime` model also aims to make
+compile-time programming feel like ordinary language code rather than a macro
+DSL.
 
-- Zig `comptime` is a broader compile-time execution model. Ordinary Zig code can
-  often run at compile time as long as the language semantics allow it.
-- The current ReScript design is more explicit and more staged. `%comptime(...)`
-  marks the compile-time boundary, and `%quote(...)` / `%splice(...)` are used to
-  construct and combine generated code.
-- Zig leans more on compile-time evaluation plus reflection such as `@typeInfo`
-  and `inline for`. The current ReScript design leans more on typed generators
-  that return code values.
-- This makes the ReScript v1 design narrower than Zig, but also easier to fit
-  into the existing compiler without redesigning the whole language around
-  compile-time execution.
+The important similarities are:
 
-## Future Directions
+- user-authored compile-time code lives in normal language syntax
+- reflection drives specialization
+- compile-time control flow produces specialized runtime code
 
-Natural next steps include:
+The important differences are:
 
-- broader pure compile-time evaluation so more ordinary ReScript helper code can
-  run during `%comptime(...)`
-- richer type reflection
-- a more complete code builder surface
-- less reliance on explicit helper scaffolding as the evaluation and reflection
-  model becomes more capable
-- support for nested, generic, and variant-driven generators
-- support for more call sites than top-level annotated bindings
-- package-distributed compile-time libraries
+- Zig integrates `comptime` more deeply into semantic analysis across the
+  language, while this ReScript implementation currently runs as a dedicated
+  typed comptime phase after the first typecheck
+- Zig allows much broader compile-time execution, while this implementation is
+  intentionally narrower and centered on reflected record-driven generators
+- Zig does not need a surface like `%comptime(...)`; ReScript keeps one explicit
+  compile-time boundary
+
+So the design goal here is not to copy Zig syntax. It is to follow the same
+general direction: compile-time logic should look like ordinary code, and the
+compiler should do the specialization work internally.
