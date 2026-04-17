@@ -27,6 +27,114 @@ The public surface is:
 - Reuse existing reflected descriptors for both inspection and type generation
 - Keep compiler-owned special forms hidden behind the public surface
 
+## Representative Examples
+
+### Compile-Time Evaluated Values
+
+```rescript
+open Comptime
+
+let three: int = %comptime(
+  if true {
+    1 + 2
+  } else {
+    failwith("unreachable int branch")
+  }
+)
+
+let greeting: string = %comptime(
+  switch "x" {
+  | "x" => "comp" ++ "time"
+  | _ => failwith("unreachable string branch")
+  }
+)
+```
+
+### Value-Level Reflection
+
+```rescript
+open Comptime
+
+type color =
+  | Red
+  | Green
+  | Blue
+
+let makeAllCases:
+  type t. unit => array<t> =
+  () =>
+    switch reflect() {
+    | Variant({constructors}) =>
+      constructors->Array.map(constructor =>
+        switch constructor.payload {
+        | NoPayload => constructor.make()
+        | _ => failwith("makeAllCases only supports no-payload variants")
+        }
+      )
+    | _ => failwith("makeAllCases only supports variants")
+    }
+
+let allColors: array<color> = %comptime(makeAllCases())
+```
+
+The reflected type comes from the binding annotation. In this example,
+`array<color>` tells `reflect()` to target the element type `color`.
+
+```rescript
+open Comptime
+
+type user = {
+  name: string,
+  age: int,
+  active: bool,
+}
+
+let makeJsonEncoder: type t. unit => t => JSON.t = ...
+let makeJsonDecoder: type t. unit => JSON.t => option<t> = ...
+let makeCopy: type t. unit => t => t = ...
+
+let encodeUser: user => JSON.t = %comptime(makeJsonEncoder())
+let decodeUser: JSON.t => option<user> = %comptime(makeJsonDecoder())
+let copyUser: user => user = %comptime(makeCopy())
+```
+
+### Type-Level Reflection
+
+```rescript
+open Comptime
+
+type user = {
+  name: string,
+  age: int,
+  active: bool,
+}
+
+type userFieldValue = %comptime(
+  {
+    let makeVariantFromFields = fields =>
+      Variant({
+        constructors:
+          fields->Array.map(field =>
+            Constructor({
+              name: field.name->String.capitalize,
+              payload: Single(field.typ),
+            })
+          ),
+      })
+    let makeVariantFromRecord = _witness =>
+      switch reflect() {
+      | Record({fields}) => makeVariantFromFields(fields)
+      | _ => failwith("userFieldValue only supports records")
+      }
+    makeVariantFromRecord(module({type t = user}))
+  }
+)
+```
+
+This keeps the user-facing generator in ordinary ReScript: `reflect()` inspects
+the witness type, and the returned descriptor expression becomes the alias
+manifest for `userFieldValue`.
+
 ## Value-Level Invocation
 
 ```rescript
