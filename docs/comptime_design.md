@@ -247,8 +247,8 @@ Each reflected constructor exposes:
 
 Current reflected target support:
 
-- same-module named records
-- same-module named ordinary variants
+- named records
+- ordinary variants
 - built-in `list`
 - built-in `result`
 
@@ -259,7 +259,6 @@ Not currently supported:
 - polymorphic variants
 - open/extensible variants
 - arbitrary recursive user-defined types
-- cross-module reflection
 
 ## Generated Type Surface
 
