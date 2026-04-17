@@ -2,19 +2,18 @@
 
 This document describes the current `comptime` proof of concept for ReScript.
 
-The user surface is intentionally small:
+The public surface is:
 
-- `%comptime(expr)`
+- `%comptime(expr)` on top-level value bindings
+- `type t = %comptime(expr)` on non-generic top-level type aliases
 - `reflect()`
-- reflected field accessors
+- reflected member accessors
   - `field.name`
   - `field.typ`
   - `field.get(value)`
-- reflected tuple item accessors
   - `item.index`
   - `item.typ`
   - `item.get(value)`
-- reflected constructor accessors
   - `constructor.name`
   - `constructor.payload`
   - `constructor.unpack(value)`
@@ -22,15 +21,13 @@ The user surface is intentionally small:
 
 ## Design Goals
 
-- Existing ReScript syntax first
-- One explicit compile-time boundary: `%comptime(...)`
-- User-authored generators
-- Type-directed reflection from ordinary type annotations
-- As little extra staging syntax as possible
+- Keep the surface close to ordinary ReScript syntax
+- Make staging boundaries explicit
+- Let users write generators as ordinary functions
+- Reuse existing reflected descriptors for both inspection and type generation
+- Keep compiler-owned special forms hidden behind the public surface
 
-## Type-Directed Invocation
-
-The call site stays inside existing ReScript syntax.
+## Value-Level Invocation
 
 ```rescript
 open Comptime
@@ -43,52 +40,75 @@ let encodeUser: user => JSON.t =
 
 The binding type annotation determines the reflected target type.
 
-Current rule:
+Current inference rules:
 
 - for `t => ...`, the reflected type is the function domain
 - for `JSON.t => option<t>`, the reflected type is the inner `t`
+- for `array<t>`, the reflected type is the element `t`
+- for `list<t>`, the reflected type is the element `t`
 
-`%comptime(...)` is currently restricted to top-level annotated `let` bindings.
+Current restriction:
 
-## Reflection Model
+- `%comptime(...)` is only supported on top-level annotated `let` bindings
 
-`reflect()` takes no explicit argument. It reflects the current locally abstract
-type in scope.
+## Type-Level Invocation
+
+Generated type aliases use the same `%comptime(...)` surface:
 
 ```rescript
 open Comptime
 
-let makeJsonEncoder: type t. unit => t => JSON.t = () => {
-  let desc = reflect()
-  ...
-}
+type userFieldValue = %comptime(
+  {
+    let makeVariantFromFields = fields =>
+      Variant({
+        constructors:
+          fields->Array.map(field =>
+            Constructor({
+              name: field.name->String.capitalize,
+              payload: Single(field.typ),
+            })
+          ),
+      })
+    let makeVariantFromRecord = _witness =>
+      switch reflect() {
+      | Record({fields}) => makeVariantFromFields(fields)
+      | _ => failwith("userFieldValue only supports records")
+      }
+    makeVariantFromRecord(module({type t = user}))
+  }
+)
 ```
 
-The descriptor space is intentionally small:
+At type level, `reflect()` reads the active module witness. The normal shape is
+to pass an anonymous witness such as `module({type t = user})` into a local
+helper and let `reflect()` read that active witness from the helper scope.
+
+The generator returns descriptor syntax such as `Variant`, `Single`, `Record`,
+`Tuple`, `Option`, and `Array`.
+
+Current restrictions:
+
+- only non-recursive, non-generic top-level type aliases are supported
+- one `type` declaration per `type` item
+- implementation files only
+- `.resi` generation is not supported
+
+## Reflection Model
+
+`reflect()` returns a compact descriptor space:
 
 - `String`
 - `Int`
 - `Float`
 - `Bool`
+- `Json`
 - `Option(desc)`
 - `Array(desc)`
 - `List(desc)`
-- `Record({name, fields})`
+- `Record({recordName, fields})`
 - `Tuple({items})`
-- `Variant({name, constructors})`
-
-Current reflection target support:
-
-- same-module named records
-- same-module named ordinary variants
-- built-in `list`
-- built-in `result`
-- no generics
-- no inline-record constructors
-- no polymorphic variants
-- no open/extensible variants
-- no arbitrary recursive user-defined types
-- no cross-module reflection
+- `Variant({variantName, constructors})`
 
 Each reflected record field exposes:
 
@@ -117,180 +137,102 @@ Each reflected constructor exposes:
 - `Single(desc)`
 - `Tuple({items})`
 
-## Compile-Time Evaluation Model
+Current reflected target support:
 
-The current implementation uses a typed comptime phase after the first
-typecheck. The important semantic point is:
+- same-module named records
+- same-module named ordinary variants
+- built-in `list`
+- built-in `result`
 
-- control flow over reflected data runs at compile time
-- ordinary runtime syntax returned from `%comptime(...)` remains runtime code
+Not currently supported:
 
-Supported in the current implementation:
+- generics
+- inline-record constructors
+- polymorphic variants
+- open/extensible variants
+- arbitrary recursive user-defined types
+- cross-module reflection
 
-- literals
-- same-module helper calls
+## Generated Type Surface
+
+Type generators use the same descriptor syntax that reflection returns.
+
+Supported generated forms are:
+
+- `String`
+- `Int`
+- `Float`
+- `Bool`
+- `Json`
+- `Option(desc)`
+- `Array(desc)`
+- `List(desc)`
+- `Tuple({items})`
+- `Record({fields})`
+- `Variant({constructors})`
+
+Generated record fields are ordinary records:
+
+```rescript
+{name: "fieldName", typ: String}
+```
+
+Generated constructors use the ordinary `Constructor({...})` surface:
+
+```rescript
+Constructor({
+  name: "ConstructorName",
+  payload: NoPayload | Single(...) | Tuple({items: [...]}),
+})
+```
+
+Tuple `items` may be produced either from reflected tuple items or from plain
+descriptor arrays such as `items->Array.map(item => item.typ)`.
+
+## Evaluation Model
+
+The current implementation lowers typed expressions into a comptime IR and
+evaluates that IR inside the compiler.
+
+What runs at compile time:
+
+- control flow over reflected metadata
+- local helper calls
 - local recursive helper functions
-- `if` / `switch`
-- `Array.forEach`
-- `Array.reduce`
-- `Array.reduceRight`
+- array iteration helpers that are explicitly lowered into comptime IR
+  - `Array.forEach`
+  - `Array.map`
+  - `Array.reduce`
+  - `Array.reduceRight`
 - `failwith("...")`
-- assertion failures
+- assertions
 
-`failwith("...")`, assertion failures, and non-exhaustive compile-time matches
-become compile-time diagnostics.
+What stays as runtime code:
 
-Not supported:
+- ordinary expressions returned from `%comptime(...)`
+- field access and constructor usage synthesized into staged runtime AST
 
-- JS interop
+Current non-goals / unsupported behavior:
+
 - unrestricted external calls
 - arbitrary mutation
-- structure or signature splicing
+- arbitrary structure or signature splicing
 - `.resi`
 
-## Ordinary Generator Syntax
+## Zig Comparison
 
-Generators are written as ordinary ReScript functions.
+Compared with Zig `comptime`, this design keeps the same broad idea of
+"ordinary language constructs evaluated during compilation", but it is narrower
+and more explicit:
 
-For JSON encoding:
+- ReScript requires an explicit `%comptime(...)` boundary
+- reflection is descriptor-based instead of exposing the full compiler type
+  system directly
+- type generation is currently limited to alias manifests instead of arbitrary
+  top-level declaration synthesis
+- first-class module witnesses provide a ReScript-native way to select the type
+  being reflected
 
-```rescript
-open Comptime
-
-let makeJsonEncoder: type t. unit => t => JSON.t = () => {
-  let rec encodeByType: type a. (typeDesc<a>, a) => JSON.t = (desc, value) =>
-    switch desc {
-    | String => JSON.String(value)
-    | Int => JSON.Number(Int.toFloat(value))
-    | Float => JSON.Number(value)
-    | Bool => JSON.Boolean(value)
-    | Json => value
-    | Option(inner) =>
-      switch value {
-      | Some(value) => encodeByType(inner, value)
-      | None => JSON.Null
-      }
-    | Array(inner) => JSON.Array(value->Array.map(item => encodeByType(inner, item)))
-    | List(inner) =>
-      JSON.Array(value->List.toArray->Array.map(item => encodeByType(inner, item)))
-    | Record({fields}) =>
-      JSON.Object(
-        fields->Array.reduce(Dict.make(), (builder, field) => {
-          let nextBuilder = Dict.copy(builder)
-          Dict.set(nextBuilder, field.name, encodeByType(field.typ, field.get(value)))
-          nextBuilder
-        }),
-      )
-    | Tuple({items}) =>
-      JSON.Array(items->Array.map(item => encodeByType(item.typ, item.get(value))))
-    | Variant({constructors}) =>
-      if constructors->Array.every(constructor =>
-           switch constructor.payload {
-           | NoPayload => true
-           | _ => false
-           }
-         ) {
-        switch constructors->Array.find(c => Option.isSome(c.unpack(value))) {
-        | Some(constructor) => JSON.String(constructor.name)
-        | None => failwith("variant value did not match any constructor")
-        }
-      } else {
-        failwith("see sample code for full payload-variant encoding")
-      }
-    }
-
-  let desc = reflect()
-  (value: t) => encodeByType(desc, value)
-}
-```
-
-For JSON decoding and generic copying, see:
-
-- [tests/comptime_test/src/comptime_test.res](/Users/mununki/github/mununki/rescript/tests/comptime_test/src/comptime_test.res)
-- [src/Main.res](/Users/mununki/github/mununki/rescript-comptime-poc/src/Main.res)
-
-Call sites:
-
-```rescript
-let encodeUser: user => JSON.t = %comptime(makeJsonEncoder())
-let decodeUser: JSON.t => option<user> = %comptime(makeJsonDecoder())
-let copyUser: user => user = %comptime(makeCopy())
-let encodeShape: shape => JSON.t = %comptime(makeJsonEncoder())
-let decodeShape: JSON.t => option<shape> = %comptime(makeJsonDecoder())
-let copyShape: shape => shape = %comptime(makeCopy())
-```
-
-## Conceptual Expansion
-
-Conceptually, the encoder above becomes ordinary code like:
-
-```rescript
-let encodeUser = (value: user) =>
-  JSON.Object(
-    Dict.fromArray([
-      ("name", value.name),
-      ("age", value.age),
-      ("active", value.active),
-    ]),
-  )
-```
-
-The decoder becomes ordinary code like:
-
-```rescript
-let decodeUser = (json: JSON.t) =>
-  switch json {
-  | JSON.Object(obj) =>
-    switch Dict.get(obj, "name") {
-    | Some(JSON.String(name)) =>
-      switch Dict.get(obj, "age") {
-      | Some(JSON.Number(age)) =>
-        switch Dict.get(obj, "active") {
-        | Some(JSON.Boolean(active)) => Some({name, age: Float.toInt(age), active})
-        | _ => None
-        }
-      | _ => None
-      }
-    | _ => None
-    }
-  | _ => None
-  }
-```
-
-And tuple / variant / list / result generators expand to ordinary runtime code in the same way.
-
-## Current Implementation Notes
-
-The current implementation uses a typed lowering and evaluator after the first
-typecheck. That means the current system is already useful for:
-
-- compile-time constant evaluation
-- record / tuple / variant / list / result driven code generation
-- removing user-authored generator helpers from runtime output
-
-## Comparison with Zig
-
-Zig is a useful reference point because its `comptime` model also aims to make
-compile-time programming feel like ordinary language code rather than a macro
-DSL.
-
-The important similarities are:
-
-- user-authored compile-time code lives in normal language syntax
-- reflection drives specialization
-- compile-time control flow produces specialized runtime code
-
-The important differences are:
-
-- Zig integrates `comptime` more deeply into semantic analysis across the
-  language, while this ReScript implementation currently runs as a dedicated
-  typed comptime phase after the first typecheck
-- Zig allows much broader compile-time execution, while this implementation is
-  intentionally narrower and centered on reflected record / tuple / variant
-  generators
-- Zig does not need a surface like `%comptime(...)`; ReScript keeps one explicit
-  compile-time boundary
-
-So the design goal here is not to copy Zig syntax. It is to follow the same
-general direction: compile-time logic should look like ordinary code, and the
-compiler should do the specialization work internally.
+The intended similarity to Zig is ergonomic, not feature parity: users should
+be able to write ordinary control flow over reflected metadata, without first
+learning a large separate metaprogramming language.

@@ -19,6 +19,27 @@ type color =
   | Green
   | Blue
 
+type userFieldValue = %comptime({
+  let makeVariantFromFields = fields => Variant({
+    constructors: fields->Array.map(field => Constructor({
+      name: field.name->String.capitalize,
+      payload: Single(field.typ),
+    })),
+  })
+  let makeVariantFromRecord = _witness =>
+    switch reflect() {
+    | Record({fields}) => makeVariantFromFields(fields)
+    | _ => failwith("userFieldValue only supports records")
+    }
+  makeVariantFromRecord(
+    module(
+      {
+        type t = user
+      }
+    ),
+  )
+})
+
 type shape =
   | Point
   | Circle(float)
@@ -79,7 +100,7 @@ and encodeVariant:
         switch constructor.payload {
         | NoPayload =>
           switch constructor.unpack(value) {
-          | Some() => encodeNoPayload(constructor.name)
+          | Some(_) => encodeNoPayload(constructor.name)
           | None => next(value)
           }
         | Single(inner) =>
@@ -336,7 +357,7 @@ and copyVariant:
         switch constructor.payload {
         | NoPayload =>
           switch constructor.unpack(value) {
-          | Some() => constructor.make()
+          | Some(_) => constructor.make()
           | None => next(value)
           }
         | Single(inner) =>
@@ -375,6 +396,20 @@ let makeCopy:
     (value: t) => copyByType(desc, value)
   }
 
+let makeAllCases:
+  type t. unit => array<t> =
+  () =>
+    switch reflect() {
+    | Variant({constructors}) =>
+      constructors->Array.map(constructor =>
+        switch constructor.payload {
+        | NoPayload => constructor.make()
+        | _ => failwith("makeAllCases only supports no-payload variants")
+        }
+      )
+    | _ => failwith("makeAllCases only supports variants")
+    }
+
 let encodeUser: user => JSON.t = %comptime(makeJsonEncoder())
 let decodeUser: JSON.t => option<user> = %comptime(makeJsonDecoder())
 let copyUser: user => user = %comptime(makeCopy())
@@ -390,6 +425,11 @@ let copyPair: pair => pair = %comptime(makeCopy())
 let encodeColor: color => JSON.t = %comptime(makeJsonEncoder())
 let decodeColor: JSON.t => option<color> = %comptime(makeJsonDecoder())
 let copyColor: color => color = %comptime(makeCopy())
+let allColors: array<color> = %comptime(makeAllCases())
+
+let encodeUserFieldValue: userFieldValue => JSON.t = %comptime(makeJsonEncoder())
+let decodeUserFieldValue: JSON.t => option<userFieldValue> = %comptime(makeJsonDecoder())
+let copyUserFieldValue: userFieldValue => userFieldValue = %comptime(makeCopy())
 
 let encodeShape: shape => JSON.t = %comptime(makeJsonEncoder())
 let decodeShape: JSON.t => option<shape> = %comptime(makeJsonDecoder())
@@ -415,6 +455,9 @@ let ada = {name: "Ada", age: 42, active: true}
 let fox = {species: "Fox", age: 5, wild: true}
 let agePair = ("Ada", 42)
 let favoriteColor = Green
+let userNameField = Name("Ada")
+let userAgeField = Age(42)
+let userActiveField = Active(true)
 let sampleShape = Rect(3., 4.)
 let numbers = list{1, 2, 3}
 let score = Ok(7)
@@ -423,6 +466,7 @@ let encodedAda = encodeUser(ada)
 let encodedFox = encodeAnimal(fox)
 let encodedPair = encodePair(agePair)
 let encodedColor = encodeColor(favoriteColor)
+let encodedUserAgeField = encodeUserFieldValue(userAgeField)
 let encodedShape = encodeShape(sampleShape)
 let encodedNumbers = encodeInts(numbers)
 let encodedScore = encodeResult(score)

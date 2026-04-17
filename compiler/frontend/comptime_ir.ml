@@ -26,12 +26,33 @@ type builtin =
   | BArrayForEach
   | BArrayReduce
   | BArrayReduceRight
+  | BStringCapitalize
   | BIntToFloat
   | BFloatToInt
   | BDictMake
   | BDictCopy
   | BDictSet
   | BDictGet
+  | BTypeString
+  | BTypeInt
+  | BTypeFloat
+  | BTypeBool
+  | BTypeJson
+  | BTypeOption
+  | BTypeArray
+  | BTypeList
+  | BTypeTuple
+  | BTypeField
+  | BTypeRecord
+  | BTypeNoPayload
+  | BTypeSinglePayload
+  | BTypeTuplePayload
+  | BTypeConstructor
+  | BTypeVariant
+  | BTypeOfDesc
+  | BDeclValue
+  | BDeclType
+  | BDeclModule
 
 type ident =
   | ILocal of Ident.t * string
@@ -53,6 +74,7 @@ type expr = {desc: expr_desc; loc: Location.t; typ: Types.type_expr; env: Env.t}
 and expr_desc =
   | EIdent of ident
   | EConstant of Parsetree.constant
+  | EWitness of Types.type_expr
   | ELet of rec_flag * binding list * expr
   | EFun of pattern * expr
   | EApply of expr * expr list
@@ -114,6 +136,30 @@ let builtin_of_path path lid prims =
   | "comptime_constructor_make" :: _ ->
     Some (IBuiltin (BConstructorMake, Some lid))
   | "comptime_erase" :: _ -> Some (IBuiltin (BErase, Some lid))
+  | "comptime_type_string" :: _ -> Some (IBuiltin (BTypeString, Some lid))
+  | "comptime_type_int" :: _ -> Some (IBuiltin (BTypeInt, Some lid))
+  | "comptime_type_float" :: _ -> Some (IBuiltin (BTypeFloat, Some lid))
+  | "comptime_type_bool" :: _ -> Some (IBuiltin (BTypeBool, Some lid))
+  | "comptime_type_json" :: _ -> Some (IBuiltin (BTypeJson, Some lid))
+  | "comptime_type_option" :: _ -> Some (IBuiltin (BTypeOption, Some lid))
+  | "comptime_type_array" :: _ -> Some (IBuiltin (BTypeArray, Some lid))
+  | "comptime_type_list" :: _ -> Some (IBuiltin (BTypeList, Some lid))
+  | "comptime_type_tuple" :: _ -> Some (IBuiltin (BTypeTuple, Some lid))
+  | "comptime_type_field" :: _ -> Some (IBuiltin (BTypeField, Some lid))
+  | "comptime_type_record" :: _ -> Some (IBuiltin (BTypeRecord, Some lid))
+  | "comptime_type_no_payload" :: _ ->
+    Some (IBuiltin (BTypeNoPayload, Some lid))
+  | "comptime_type_single_payload" :: _ ->
+    Some (IBuiltin (BTypeSinglePayload, Some lid))
+  | "comptime_type_tuple_payload" :: _ ->
+    Some (IBuiltin (BTypeTuplePayload, Some lid))
+  | "comptime_type_constructor" :: _ ->
+    Some (IBuiltin (BTypeConstructor, Some lid))
+  | "comptime_type_variant" :: _ -> Some (IBuiltin (BTypeVariant, Some lid))
+  | "comptime_type_of_desc" :: _ -> Some (IBuiltin (BTypeOfDesc, Some lid))
+  | "comptime_decl_value" :: _ -> Some (IBuiltin (BDeclValue, Some lid))
+  | "comptime_decl_type" :: _ -> Some (IBuiltin (BDeclType, Some lid))
+  | "comptime_decl_module" :: _ -> Some (IBuiltin (BDeclModule, Some lid))
   | _ -> (
     match longident_last lid.txt with
     | "reflect" when path_name_ends_with path "Comptime.reflect" ->
@@ -141,6 +187,30 @@ let builtin_of_path path lid prims =
       when path_name_ends_with path "Array.reduceRight"
            || path_name_ends_with path "Stdlib_Array.reduceRight" ->
       Some (IBuiltin (BArrayReduceRight, Some lid))
+    | "make"
+      when path_name_ends_with path "Dict.make"
+           || path_name_ends_with path "Stdlib!.Dict.make"
+           || path_name_ends_with path "Stdlib_Dict.make" ->
+      Some (IBuiltin (BDictMake, Some lid))
+    | "copy"
+      when path_name_ends_with path "Dict.copy"
+           || path_name_ends_with path "Stdlib!.Dict.copy"
+           || path_name_ends_with path "Stdlib_Dict.copy" ->
+      Some (IBuiltin (BDictCopy, Some lid))
+    | "set"
+      when path_name_ends_with path "Dict.set"
+           || path_name_ends_with path "Stdlib!.Dict.set"
+           || path_name_ends_with path "Stdlib_Dict.set" ->
+      Some (IBuiltin (BDictSet, Some lid))
+    | "get"
+      when path_name_ends_with path "Dict.get"
+           || path_name_ends_with path "Stdlib!.Dict.get"
+           || path_name_ends_with path "Stdlib_Dict.get" ->
+      Some (IBuiltin (BDictGet, Some lid))
+    | "capitalize"
+      when path_name_ends_with path "String.capitalize"
+           || path_name_ends_with path "Stdlib_String.capitalize" ->
+      Some (IBuiltin (BStringCapitalize, Some lid))
     | "toFloat"
       when path_name_ends_with path "Int.toFloat"
            || path_name_ends_with path "Stdlib_Int.toFloat" ->
@@ -170,6 +240,21 @@ let rec lower_pattern pat =
     Location.raise_errorf ~loc:pat.pat_loc
       "Unsupported pattern in typed comptime lowering"
 
+let witness_type_of_package ~loc ty =
+  match (Ctype.repr ty).desc with
+  | Types.Tpackage (_path, names, tys) -> (
+    match
+      List.combine names tys
+      |> List.find_opt (fun (name, _ty) -> name = Longident.Lident "t")
+    with
+    | Some (_name, ty) -> ty
+    | None ->
+      Location.raise_errorf ~loc
+        "Comptime module witnesses must provide `type t`")
+  | _ ->
+    Location.raise_errorf ~loc
+      "Expected a first-class module witness with `type t`"
+
 let rec lower_expr top_ids expr =
   let make desc =
     {desc; loc = expr.exp_loc; typ = expr.exp_type; env = expr.exp_env}
@@ -193,6 +278,8 @@ let rec lower_expr top_ids expr =
       | Path.Pident id -> make (EIdent (ILocal (id, Ident.name id)))
       | _ -> make (EIdent (IGlobal lid))))
   | Texp_constant c -> make (EConstant (Untypeast.constant c))
+  | Texp_pack _module_expr ->
+    make (EWitness (witness_type_of_package ~loc:expr.exp_loc expr.exp_type))
   | Texp_let (rec_flag, bindings, body) ->
     let bindings =
       List.map

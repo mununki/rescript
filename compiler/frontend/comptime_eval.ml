@@ -37,12 +37,41 @@ and resolved_constructor = {
 
 type builder_kind = Builder_unknown | Builder_tuple
 
-type value =
+type generated_type =
+  | GType_string
+  | GType_int
+  | GType_float
+  | GType_bool
+  | GType_json
+  | GType_option of generated_type
+  | GType_array of generated_type
+  | GType_list of generated_type
+  | GType_tuple of generated_type list
+  | GType_record of (string * generated_type) list
+  | GType_variant of generated_constructor list
+
+and generated_payload =
+  | GPayload_none
+  | GPayload_single of generated_type
+  | GPayload_tuple of generated_type list
+
+and generated_constructor = {
+  generated_constructor_name: string;
+  generated_constructor_payload: generated_payload;
+}
+
+and generated_decl =
+  | GDecl_value of string * value
+  | GDecl_type of string * generated_type
+  | GDecl_module of string * generated_decl list
+
+and value =
   | VUnit
   | VInt of int
   | VFloat of float
   | VString of string
   | VBool of bool
+  | VWitness of Types.type_expr
   | VArray of value list
   | VTuple of value list
   | VRecord of value StringMap.t
@@ -50,6 +79,11 @@ type value =
   | VClosure of closure
   | VBuiltin of builtin
   | VBuilder of builder_kind ref * (string * expression) list ref
+  | VTypeExpr of generated_type
+  | VTypeField of string * generated_type
+  | VTypePayload of generated_payload
+  | VTypeConstructor of generated_constructor
+  | VDecl of generated_decl
   | VCode of expression
 
 and closure = {pattern: Ir.pattern; body: Ir.expr; env: value Ident.tbl ref}
@@ -68,6 +102,7 @@ and context = {
   mutable cache: value Ident.tbl;
   mutable used_top: IdentSet.t;
   target_type: Types.type_expr option;
+  active_types: Types.type_expr list;
   type_env: Env.t;
 }
 
@@ -81,6 +116,53 @@ let stage_expression context env expr = !stage_expression_ref context env expr
 
 let errorf ~loc fmt =
   Format.kasprintf (fun message -> Location.raise_errorf ~loc "%s" message) fmt
+
+let current_reflected_type context =
+  match context.active_types with
+  | target :: _ -> Some target
+  | [] -> context.target_type
+
+let introduced_witnesses bindings =
+  Ident.fold_name
+    (fun _id value witnesses ->
+      match value with
+      | VWitness ty -> ty :: witnesses
+      | _ -> witnesses)
+    bindings []
+
+let with_introduced_witnesses context witnesses =
+  match witnesses with
+  | [] -> context
+  | witness :: rest ->
+    if rest <> [] then
+      errorf ~loc:Location.none
+        "reflect() is ambiguous because more than one module witness is active \
+         in the same scope";
+    {context with active_types = witness :: context.active_types}
+
+let rec value_kind = function
+  | VUnit -> "unit"
+  | VInt _ -> "int"
+  | VFloat _ -> "float"
+  | VString _ -> "string"
+  | VBool _ -> "bool"
+  | VWitness _ -> "witness"
+  | VArray _ -> "array"
+  | VTuple _ -> "tuple"
+  | VRecord _ -> "record"
+  | VVariant (name, _) -> "variant(" ^ name ^ ")"
+  | VClosure _ -> "closure"
+  | VBuiltin _ -> "builtin"
+  | VBuilder _ -> "builder"
+  | VTypeExpr _ -> "type-expr"
+  | VTypeField _ -> "type-field"
+  | VTypePayload _ -> "type-payload"
+  | VTypeConstructor _ -> "type-constructor"
+  | VDecl (GDecl_value (name, value)) ->
+    "decl.value(" ^ name ^ ", " ^ value_kind value ^ ")"
+  | VDecl (GDecl_type (name, _)) -> "decl.type(" ^ name ^ ")"
+  | VDecl (GDecl_module (name, _)) -> "decl.module(" ^ name ^ ")"
+  | VCode _ -> "code"
 
 let lid txt = Location.mknoloc (Longident.Lident txt)
 
@@ -102,12 +184,13 @@ let is_comptime_constructor ctor_lid name =
   match name with
   | "()" | "true" | "false" | "None" | "Some" | "String" | "Int" | "Float"
   | "Bool" | "Json" | "Option" | "Array" | "List" | "Record" | "Tuple"
-  | "Variant" | "NoPayload" | "Single" | "StringField" | "IntField"
-  | "FloatField" | "BoolField" | "JsonField" | "OptionField" | "ArrayField"
-  | "ListField" | "RecordField" | "TupleField" | "VariantField" | "StringItem"
-  | "IntItem" | "FloatItem" | "BoolItem" | "JsonItem" | "OptionItem"
-  | "ArrayItem" | "ListItem" | "RecordItem" | "TupleItem" | "VariantItem"
-  | "NoPayloadConstructor" | "SingleConstructor" | "TupleConstructor" ->
+  | "Variant" | "NoPayload" | "Single" | "Field" | "Constructor" | "StringField"
+  | "IntField" | "FloatField" | "BoolField" | "JsonField" | "OptionField"
+  | "ArrayField" | "ListField" | "RecordField" | "TupleField" | "VariantField"
+  | "StringItem" | "IntItem" | "FloatItem" | "BoolItem" | "JsonItem"
+  | "OptionItem" | "ArrayItem" | "ListItem" | "RecordItem" | "TupleItem"
+  | "VariantItem" | "NoPayloadConstructor" | "SingleConstructor"
+  | "TupleConstructor" ->
     true
   | _ -> false
 
@@ -227,6 +310,109 @@ let resolve_type env ty =
       errorf ~loc:Location.none "Unsupported type shape in comptime reflection"
   in
   loop [] ty
+
+let rec generated_type_of_resolved_type = function
+  | Type_string -> GType_string
+  | Type_int -> GType_int
+  | Type_float -> GType_float
+  | Type_bool -> GType_bool
+  | Type_json -> GType_json
+  | Type_option inner -> GType_option (generated_type_of_resolved_type inner)
+  | Type_array inner -> GType_array (generated_type_of_resolved_type inner)
+  | Type_list inner -> GType_list (generated_type_of_resolved_type inner)
+  | Type_record (_name, fields) ->
+    GType_record
+      (List.map
+         (fun field ->
+           (field.field_name, generated_type_of_resolved_type field.field_type))
+         fields)
+  | Type_tuple items ->
+    GType_tuple
+      (List.map
+         (fun item -> generated_type_of_resolved_type item.item_type)
+         items)
+  | Type_variant (_name, constructors) ->
+    GType_variant
+      (List.map
+         (fun constructor ->
+           let generated_constructor_payload =
+             match constructor.constructor_payload with
+             | Payload_none -> GPayload_none
+             | Payload_single inner ->
+               GPayload_single (generated_type_of_resolved_type inner)
+             | Payload_tuple items ->
+               GPayload_tuple
+                 (List.map
+                    (fun item -> generated_type_of_resolved_type item.item_type)
+                    items)
+           in
+           {
+             generated_constructor_name = constructor.constructor_name;
+             generated_constructor_payload;
+           })
+         constructors)
+
+let type_name name = Location.mknoloc name
+
+let rec core_type_of_generated_type ~loc = function
+  | GType_string -> Typ.constr ~loc (lid "string") []
+  | GType_int -> Typ.constr ~loc (lid "int") []
+  | GType_float -> Typ.constr ~loc (lid "float") []
+  | GType_bool -> Typ.constr ~loc (lid "bool") []
+  | GType_json ->
+    Typ.constr ~loc
+      (Location.mknoloc (Longident.Ldot (Longident.Lident "JSON", "t")))
+      []
+  | GType_option inner ->
+    Typ.constr ~loc (lid "option") [core_type_of_generated_type ~loc inner]
+  | GType_array inner ->
+    Typ.constr ~loc (lid "array") [core_type_of_generated_type ~loc inner]
+  | GType_list inner ->
+    Typ.constr ~loc (lid "list") [core_type_of_generated_type ~loc inner]
+  | GType_tuple items ->
+    Typ.tuple ~loc (List.map (core_type_of_generated_type ~loc) items)
+  | GType_record _ | GType_variant _ ->
+    errorf ~loc
+      "Record and variant generated types cannot be used as core type manifests"
+
+let type_declaration_of_generated_type ~loc name generated_type =
+  let mk ?manifest kind =
+    Type.mk ~loc ?manifest (Location.mknoloc name) ~kind
+  in
+  match generated_type with
+  | GType_string | GType_int | GType_float | GType_bool | GType_json
+  | GType_option _ | GType_array _ | GType_list _ | GType_tuple _ ->
+    mk
+      ~manifest:(core_type_of_generated_type ~loc generated_type)
+      Ptype_abstract
+  | GType_record fields ->
+    let labels =
+      List.map
+        (fun (field_name, field_type) ->
+          Type.field
+            (Location.mknoloc field_name)
+            (core_type_of_generated_type ~loc field_type))
+        fields
+    in
+    mk (Ptype_record labels)
+  | GType_variant constructors ->
+    let constructors =
+      List.map
+        (fun constructor ->
+          let args =
+            match constructor.generated_constructor_payload with
+            | GPayload_none -> Pcstr_tuple []
+            | GPayload_single inner ->
+              Pcstr_tuple [core_type_of_generated_type ~loc inner]
+            | GPayload_tuple inners ->
+              Pcstr_tuple (List.map (core_type_of_generated_type ~loc) inners)
+          in
+          Type.constructor
+            (Location.mknoloc constructor.generated_constructor_name)
+            ~args)
+        constructors
+    in
+    mk (Ptype_variant constructors)
 
 let field_get_builtin field_name =
   VBuiltin
@@ -814,6 +1000,116 @@ let resolve_builder_expected_type context expected =
     | None -> None)
   | _ -> None
 
+let rec generated_item_type_of_value ~loc = function
+  | VVariant (_, Some (VRecord item_payload)) | VRecord item_payload -> (
+    match StringMap.find_opt "__type" item_payload with
+    | Some typ -> generated_type_of_value ~loc typ
+    | None ->
+      errorf ~loc "Tuple item descriptor is missing comptime type metadata")
+  | value -> generated_type_of_value ~loc value
+
+and generated_field_of_value ~loc = function
+  | VTypeField (name, typ) -> (name, typ)
+  | VVariant ("Field", Some payload) -> generated_field_of_value ~loc payload
+  | VVariant (_, Some (VRecord field_payload)) | VRecord field_payload -> (
+    match
+      ( StringMap.find_opt "fieldName" field_payload,
+        StringMap.find_opt "__type" field_payload,
+        StringMap.find_opt "name" field_payload,
+        StringMap.find_opt "typ" field_payload )
+    with
+    | Some (VString name), Some typ, _, _ ->
+      (name, generated_type_of_value ~loc typ)
+    | _, _, Some (VString name), Some typ ->
+      (name, generated_type_of_value ~loc typ)
+    | _ -> errorf ~loc "Record field descriptor is missing comptime metadata")
+  | _ -> errorf ~loc "Expected a reflected or generated record field"
+
+and generated_type_of_value ~loc = function
+  | VTypeExpr generated -> generated
+  | VVariant ("String", None) -> GType_string
+  | VVariant ("Int", None) -> GType_int
+  | VVariant ("Float", None) -> GType_float
+  | VVariant ("Bool", None) -> GType_bool
+  | VVariant ("Json", None) -> GType_json
+  | VVariant ("Option", Some inner) ->
+    GType_option (generated_type_of_value ~loc inner)
+  | VVariant ("Array", Some inner) ->
+    GType_array (generated_type_of_value ~loc inner)
+  | VVariant ("List", Some inner) ->
+    GType_list (generated_type_of_value ~loc inner)
+  | VVariant ("Tuple", Some (VRecord payload)) -> (
+    match StringMap.find_opt "items" payload with
+    | Some (VArray items) ->
+      GType_tuple (List.map (generated_item_type_of_value ~loc) items)
+    | _ -> errorf ~loc "Tuple descriptor is missing `items`")
+  | VVariant ("Record", Some (VRecord payload)) -> (
+    match StringMap.find_opt "fields" payload with
+    | Some (VArray fields) ->
+      GType_record (List.map (generated_field_of_value ~loc) fields)
+    | _ -> errorf ~loc "Record descriptor is missing `fields`")
+  | VVariant ("Variant", Some (VRecord payload)) -> (
+    match StringMap.find_opt "constructors" payload with
+    | Some (VArray constructors) ->
+      GType_variant
+        (List.map (generated_constructor_of_value ~loc) constructors)
+    | _ -> errorf ~loc "Variant descriptor is missing `constructors`")
+  | _ -> errorf ~loc "Expected a comptime type descriptor or type builder"
+
+and generated_payload_of_value ~loc = function
+  | VTypePayload payload -> payload
+  | VVariant ("NoPayload", None) -> GPayload_none
+  | VVariant ("Single", Some inner) ->
+    GPayload_single (generated_type_of_value ~loc inner)
+  | VVariant ("Tuple", Some (VRecord payload)) -> (
+    match StringMap.find_opt "items" payload with
+    | Some (VArray items) ->
+      GPayload_tuple (List.map (generated_item_type_of_value ~loc) items)
+    | _ -> errorf ~loc "Tuple payload descriptor is missing `items`")
+  | _ -> errorf ~loc "Expected a comptime payload builder"
+
+and generated_constructor_of_value ~loc = function
+  | VTypeConstructor constructor -> constructor
+  | VVariant ("Constructor", Some payload) ->
+    generated_constructor_of_value ~loc payload
+  | VVariant
+      ( ("NoPayloadConstructor" | "SingleConstructor" | "TupleConstructor"),
+        Some (VRecord payload) ) -> (
+    match
+      ( StringMap.find_opt "constructorName" payload,
+        StringMap.find_opt "__payload" payload )
+    with
+    | Some (VString name), Some payload ->
+      {
+        generated_constructor_name = name;
+        generated_constructor_payload = generated_payload_of_value ~loc payload;
+      }
+    | _ -> errorf ~loc "Constructor descriptor is missing comptime metadata")
+  | VRecord payload -> (
+    match
+      (StringMap.find_opt "name" payload, StringMap.find_opt "payload" payload)
+    with
+    | Some (VString name), Some payload ->
+      {
+        generated_constructor_name = name;
+        generated_constructor_payload = generated_payload_of_value ~loc payload;
+      }
+    | _ ->
+      errorf ~loc "Expected a reflected or generated constructor descriptor")
+  | _ -> errorf ~loc "Expected a comptime constructor descriptor or builder"
+
+let generated_decl_of_value ~loc = function
+  | VDecl decl -> decl
+  | _ -> errorf ~loc "Expected a comptime declaration builder"
+
+let generated_decl_list_of_value ~loc = function
+  | VArray decls -> List.map (generated_decl_of_value ~loc) decls
+  | VDecl decl -> [decl]
+  | _ ->
+    errorf ~loc
+      "Attached `@comptime` generators must return a declaration or array of \
+       declarations"
+
 let rec expr_of_value ~loc ?expected_type context = function
   | VUnit -> Exp.construct ~loc (lid "()") None
   | VInt i -> exp_int i
@@ -911,7 +1207,9 @@ let rec expr_of_value ~loc ?expected_type context = function
                 (Longident.Ldot (Longident.Lident "Dict", "fromArray"))))
           [(Nolabel, Exp.array tuple_entries)]))
   | VClosure closure -> expr_of_closure ~loc ?expected_type context closure
-  | _ -> errorf ~loc "Unsupported comptime value reification"
+  | value ->
+    errorf ~loc "Unsupported comptime value reification for %s"
+      (value_kind value)
 
 and expr_of_closure ~loc:_ ?expected_type context closure =
   let ret_type =
@@ -1005,6 +1303,38 @@ let runtime_expr_of_value ~loc context = function
 let runtime_expr_of_value_with_expected ~loc context expected_type = function
   | VCode expr -> expr
   | value -> expr_of_value ~loc ~expected_type context value
+
+let wrap_value_with_runtime_bindings ~loc context runtime_bindings value =
+  VCode
+    (Exp.let_ Nonrecursive runtime_bindings (expr_of_value ~loc context value))
+
+let rec bind_runtime_bindings_in_generated_decl ~loc context runtime_bindings =
+  function
+  | GDecl_value (name, value) ->
+    GDecl_value
+      ( name,
+        wrap_value_with_runtime_bindings ~loc context runtime_bindings value )
+  | GDecl_type _ as decl -> decl
+  | GDecl_module (name, decls) ->
+    GDecl_module
+      ( name,
+        List.map
+          (bind_runtime_bindings_in_generated_decl ~loc context runtime_bindings)
+          decls )
+
+let rec structure_items_of_generated_decls ~loc context decls =
+  List.map (structure_item_of_generated_decl ~loc context) decls
+
+and structure_item_of_generated_decl ~loc context = function
+  | GDecl_value (name, value) ->
+    let expr = expr_of_value ~loc context value in
+    Str.value Nonrecursive [Vb.mk (Pat.var (Location.mknoloc name)) expr]
+  | GDecl_type (name, body) ->
+    Str.type_ Nonrecursive [type_declaration_of_generated_type ~loc name body]
+  | GDecl_module (name, decls) ->
+    Str.module_
+      (Mb.mk (Location.mknoloc name)
+         (Mod.structure (structure_items_of_generated_decls ~loc context decls)))
 
 let rec match_pattern ~loc pattern value =
   match (pattern, value) with
@@ -1101,16 +1431,19 @@ let rec eval_case_list context env loc scrutinee = function
     match match_pattern ~loc:case.Ir.loc case.Ir.lhs scrutinee with
     | None -> eval_case_list context env loc scrutinee rest
     | Some bindings -> (
+      let case_context =
+        with_introduced_witnesses context (introduced_witnesses bindings)
+      in
       let case_env =
         Ident.fold_name
           (fun id value env -> Ident.add id value env)
           bindings env
       in
       match case.Ir.guard with
-      | None -> eval context case_env case.Ir.rhs
+      | None -> eval case_context case_env case.Ir.rhs
       | Some guard -> (
-        match eval context case_env guard with
-        | VBool true -> eval context case_env case.Ir.rhs
+        match eval case_context case_env guard with
+        | VBool true -> eval case_context case_env case.Ir.rhs
         | VBool false -> eval_case_list context env loc scrutinee rest
         | _ ->
           errorf ~loc:guard.loc
@@ -1178,14 +1511,14 @@ and eval_ident context loc = function
         unary (fun context loc args ->
             match args with
             | [VUnit] -> (
-              match context.target_type with
+              match current_reflected_type context with
               | Some target ->
                 type_desc_value_of_resolved_type
                   (resolve_type context.type_env target)
               | None ->
                 errorf ~loc
-                  "reflect() requires a call site type annotation that \
-                   identifies the reflected type")
+                  "reflect() requires either a call site type annotation or an \
+                   active module witness that identifies the reflected type")
             | _ -> errorf ~loc "reflect() expects unit")
       | Ir.BFailwith ->
         unary (fun _context loc args ->
@@ -1443,6 +1776,20 @@ and eval_ident context loc = function
                      (Nolabel, callback);
                    ])
             | _ -> errorf ~loc "Array.reduceRight expects array, init, function")
+      | Ir.BStringCapitalize ->
+        unary (fun _context loc args ->
+            match args with
+            | [VString value] ->
+              if value = "" then VString value
+              else
+                VString
+                  (String.uppercase_ascii (String.sub value 0 1)
+                  ^ String.sub value 1 (String.length value - 1))
+            | [value] ->
+              VCode
+                (Exp.apply runtime_expr
+                   [(Nolabel, runtime_expr_of_value ~loc context value)])
+            | _ -> errorf ~loc "String.capitalize expects one argument")
       | Ir.BIntToFloat ->
         unary (fun _context loc args ->
             match args with
@@ -1504,6 +1851,115 @@ and eval_ident context loc = function
                      (Nolabel, runtime_expr_of_value ~loc context key);
                    ])
             | _ -> errorf ~loc "Dict.get expects two arguments")
+      | Ir.BTypeString -> VTypeExpr GType_string
+      | Ir.BTypeInt -> VTypeExpr GType_int
+      | Ir.BTypeFloat -> VTypeExpr GType_float
+      | Ir.BTypeBool -> VTypeExpr GType_bool
+      | Ir.BTypeJson -> VTypeExpr GType_json
+      | Ir.BTypeOption ->
+        unary (fun _context loc args ->
+            match args with
+            | [value] ->
+              VTypeExpr (GType_option (generated_type_of_value ~loc value))
+            | _ -> errorf ~loc "Comptime.Type.option expects one argument")
+      | Ir.BTypeArray ->
+        unary (fun _context loc args ->
+            match args with
+            | [value] ->
+              VTypeExpr (GType_array (generated_type_of_value ~loc value))
+            | _ -> errorf ~loc "Comptime.Type.array expects one argument")
+      | Ir.BTypeList ->
+        unary (fun _context loc args ->
+            match args with
+            | [value] ->
+              VTypeExpr (GType_list (generated_type_of_value ~loc value))
+            | _ -> errorf ~loc "Comptime.Type.list expects one argument")
+      | Ir.BTypeTuple ->
+        unary (fun _context loc args ->
+            match args with
+            | [VArray values] ->
+              VTypeExpr
+                (GType_tuple
+                   (List.map (generated_item_type_of_value ~loc) values))
+            | _ -> errorf ~loc "Comptime.Type.tuple expects an array")
+      | Ir.BTypeField ->
+        binary (fun _context loc args ->
+            match args with
+            | [VString name; value] ->
+              VTypeField (name, generated_type_of_value ~loc value)
+            | _ -> errorf ~loc "Comptime.Type.field expects a string and a type")
+      | Ir.BTypeRecord ->
+        unary (fun _context loc args ->
+            match args with
+            | [VArray fields] ->
+              VTypeExpr
+                (GType_record (List.map (generated_field_of_value ~loc) fields))
+            | _ -> errorf ~loc "Comptime.Type.record expects an array")
+      | Ir.BTypeNoPayload -> VTypePayload GPayload_none
+      | Ir.BTypeSinglePayload ->
+        unary (fun _context loc args ->
+            match args with
+            | [value] ->
+              VTypePayload
+                (GPayload_single (generated_type_of_value ~loc value))
+            | _ ->
+              errorf ~loc "Comptime.Type.singlePayload expects one argument")
+      | Ir.BTypeTuplePayload ->
+        unary (fun _context loc args ->
+            match args with
+            | [VArray values] ->
+              VTypePayload
+                (GPayload_tuple
+                   (List.map (generated_item_type_of_value ~loc) values))
+            | _ -> errorf ~loc "Comptime.Type.tuplePayload expects an array")
+      | Ir.BTypeConstructor ->
+        binary (fun _context loc args ->
+            match args with
+            | [VString name; payload] ->
+              VTypeConstructor
+                {
+                  generated_constructor_name = name;
+                  generated_constructor_payload =
+                    generated_payload_of_value ~loc payload;
+                }
+            | _ ->
+              errorf ~loc
+                "Comptime.Type.constructor expects a string and payload")
+      | Ir.BTypeVariant ->
+        unary (fun _context loc args ->
+            match args with
+            | [VArray constructors] ->
+              VTypeExpr
+                (GType_variant
+                   (List.map (generated_constructor_of_value ~loc) constructors))
+            | _ -> errorf ~loc "Comptime.Type.variant expects an array")
+      | Ir.BTypeOfDesc ->
+        unary (fun _context loc args ->
+            match args with
+            | [value] -> VTypeExpr (generated_type_of_value ~loc value)
+            | _ -> errorf ~loc "Comptime.Type.ofDesc expects one argument")
+      | Ir.BDeclValue ->
+        binary (fun _context loc args ->
+            match args with
+            | [VString name; value] -> VDecl (GDecl_value (name, value))
+            | _ ->
+              errorf ~loc "Comptime.Decl.value expects a string and a value")
+      | Ir.BDeclType ->
+        binary (fun _context loc args ->
+            match args with
+            | [VString name; value] ->
+              VDecl (GDecl_type (name, generated_type_of_value ~loc value))
+            | _ -> errorf ~loc "Comptime.Decl.type_ expects a string and a type")
+      | Ir.BDeclModule ->
+        binary (fun _context loc args ->
+            match args with
+            | [VString name; VArray decls] ->
+              VDecl
+                (GDecl_module
+                   (name, List.map (generated_decl_of_value ~loc) decls))
+            | _ ->
+              errorf ~loc
+                "Comptime.Decl.module_ expects a string and declaration array")
     in
     fun _env -> value
 
@@ -1512,6 +1968,7 @@ and eval context env expr =
   | Ir.EConstant (Pconst_integer (text, None)) -> VInt (int_of_string text)
   | Ir.EConstant (Pconst_float (text, _)) -> VFloat (float_of_string text)
   | Ir.EConstant (Pconst_string (text, _)) -> VString text
+  | Ir.EWitness ty -> VWitness ty
   | Ir.EConstant _ ->
     errorf ~loc:expr.Ir.loc "Unsupported constant in comptime evaluation"
   | Ir.EIdent ident -> eval_ident context expr.Ir.loc ident env
@@ -1539,20 +1996,21 @@ and eval context env expr =
     in
     VCode (Exp.construct ctor_lid payload)
   | Ir.ELet (Nonrecursive, bindings, body) ->
-    let env =
+    let env, witness_bindings =
       List.fold_left
-        (fun env (binding : Ir.binding) ->
+        (fun (env, witnesses) (binding : Ir.binding) ->
           let value = eval context env binding.Ir.expr in
           match match_pattern ~loc:binding.Ir.loc binding.Ir.pattern value with
           | Some bindings ->
-            Ident.fold_name
-              (fun id value env -> Ident.add id value env)
-              bindings env
+            ( Ident.fold_name
+                (fun id value env -> Ident.add id value env)
+                bindings env,
+              introduced_witnesses bindings @ witnesses )
           | None ->
             errorf ~loc:binding.Ir.loc "Failed to bind a comptime let-pattern")
-        env bindings
+        (env, []) bindings
     in
-    eval context env body
+    eval (with_introduced_witnesses context witness_bindings) env body
   | Ir.ELet (Recursive, bindings, body) ->
     let env = build_recursive_env context env bindings in
     eval context env body
@@ -1606,13 +2064,16 @@ and apply context ~loc fn args =
     | arg :: rest -> (
       match match_pattern ~loc closure.pattern arg with
       | Some bindings ->
+        let closure_context =
+          with_introduced_witnesses context (introduced_witnesses bindings)
+        in
         let env =
           Ident.fold_name
             (fun id value env -> Ident.add id value env)
             bindings !(closure.env)
         in
-        let result = stage_expression context env closure.body in
-        if rest = [] then result else apply context ~loc result rest
+        let result = stage_expression closure_context env closure.body in
+        if rest = [] then result else apply closure_context ~loc result rest
       | None -> errorf ~loc "Failed to apply comptime function"))
   | VCode fn_expr ->
     let arg_exprs = List.map (runtime_expr_of_value ~loc context) args in
@@ -1625,6 +2086,7 @@ and stage_expression_impl context env expr =
   | Ir.EConstant (Pconst_integer (text, None)) -> VInt (int_of_string text)
   | Ir.EConstant (Pconst_float (text, _)) -> VFloat (float_of_string text)
   | Ir.EConstant (Pconst_string (text, _)) -> VString text
+  | Ir.EWitness ty -> VWitness ty
   | Ir.EConstant _ ->
     errorf ~loc:expr.Ir.loc "Unsupported constant in comptime staging"
   | Ir.EIdent ident -> eval_ident context expr.Ir.loc ident env
@@ -1757,14 +2219,19 @@ and stage_expression_impl context env expr =
            StringMap.empty rows)
 
 and stage_let context env bindings body =
-  let env, runtime_bindings =
+  let env, runtime_bindings, witness_bindings =
     List.fold_left
-      (fun (env, runtime_bindings) (binding : Ir.binding) ->
+      (fun (env, runtime_bindings, witnesses) (binding : Ir.binding) ->
         let value = stage_expression context env binding.Ir.expr in
         match
           (binding_name_from_pattern binding.Ir.pattern, value_is_runtime value)
         with
-        | Some id, false -> (Ident.add id value env, runtime_bindings)
+        | Some id, false ->
+          ( Ident.add id value env,
+            runtime_bindings,
+            match value with
+            | VWitness ty -> ty :: witnesses
+            | _ -> witnesses )
         | Some id, true ->
           let runtime_expr =
             runtime_expr_of_value ~loc:binding.Ir.loc context value
@@ -1772,21 +2239,45 @@ and stage_let context env bindings body =
           let name = Ident.name id in
           let env = Ident.add id (VCode (exp_ident name)) env in
           let binding = Vb.mk (Pat.var (Location.mknoloc name)) runtime_expr in
-          (env, runtime_bindings @ [binding])
-        | None, false -> (env, runtime_bindings)
+          (env, runtime_bindings @ [binding], witnesses)
+        | None, false -> (env, runtime_bindings, witnesses)
         | None, true ->
           errorf ~loc:binding.Ir.loc
             "Comptime staging only supports runtime let bindings for simple \
              variable patterns")
-      (env, []) bindings
+      (env, [], []) bindings
   in
-  let body_value = stage_expression context env body in
+  let body_context = with_introduced_witnesses context witness_bindings in
+  let body_value = stage_expression body_context env body in
   match runtime_bindings with
   | [] -> body_value
-  | _ ->
-    VCode
-      (Exp.let_ Nonrecursive runtime_bindings
-         (expr_of_value ~loc:body.Ir.loc context body_value))
+  | _ -> (
+    let wrapped_decls values =
+      List.map
+        (function
+          | VDecl decl ->
+            VDecl
+              (bind_runtime_bindings_in_generated_decl ~loc:body.Ir.loc context
+                 runtime_bindings decl)
+          | _ -> assert false)
+        values
+    in
+    match body_value with
+    | VDecl decl ->
+      VDecl
+        (bind_runtime_bindings_in_generated_decl ~loc:body.Ir.loc context
+           runtime_bindings decl)
+    | VArray values
+      when List.for_all
+             (function
+               | VDecl _ -> true
+               | _ -> false)
+             values ->
+      VArray (wrapped_decls values)
+    | _ ->
+      VCode
+        (Exp.let_ Nonrecursive runtime_bindings
+           (expr_of_value ~loc:body.Ir.loc context body_value)))
 
 and stage_sequence context loc left_value right_value =
   match left_value with
@@ -1829,6 +2320,9 @@ and stage_match context env loc scrutinee_value cases =
         match match_pattern ~loc:case.Ir.loc case.Ir.lhs scrutinee_value with
         | None -> select_case rest
         | Some bindings ->
+          let case_context =
+            with_introduced_witnesses context (introduced_witnesses bindings)
+          in
           let env =
             Ident.fold_name
               (fun id value env -> Ident.add id value env)
@@ -1838,13 +2332,13 @@ and stage_match context env loc scrutinee_value cases =
             match case.Ir.guard with
             | None -> true
             | Some guard -> (
-              match stage_expression context env guard with
+              match stage_expression case_context env guard with
               | VBool result -> result
               | _ ->
                 errorf ~loc:guard.Ir.loc
                   "Comptime guard expressions must evaluate to bool")
           in
-          if guard_ok then stage_expression context env case.Ir.rhs
+          if guard_ok then stage_expression case_context env case.Ir.rhs
           else select_case rest)
     in
     select_case cases
@@ -1893,6 +2387,9 @@ let extract_target_type_from_expected ty =
         Some inner
       | _ -> None
     else Some arg
+  | Types.Tconstr (path, [inner], _)
+    when Path.name path = "array" || Path.name path = "list" ->
+    Some inner
   | _ -> None
 
 let is_surface_module = function
@@ -1984,40 +2481,115 @@ let rec parsetree_binding_name_from_pattern pat =
     parsetree_binding_name_from_pattern pat
   | _ -> None
 
-let rewrite ~typedtree ast =
-  let () = stage_expression_ref := stage_expression_impl in
+let top_bindings_of_typedtree (typedtree : Typedtree.structure) =
+  List.fold_left
+    (fun tbl (item : Typedtree.structure_item) ->
+      match item.str_desc with
+      | Tstr_value (_, bindings) ->
+        List.fold_left
+          (fun tbl (binding : Typedtree.value_binding) ->
+            match Typecore.id_of_pattern binding.vb_pat with
+            | Some id ->
+              Ident.add id
+                {
+                  source_name = Ident.name id;
+                  source_expr = binding.vb_expr;
+                  source_loc = binding.vb_loc;
+                }
+                tbl
+            | None -> tbl)
+          tbl bindings
+      | _ -> tbl)
+    Ident.empty typedtree.str_items
+
+let context_of_typedtree ~typedtree ~target_type =
   let top_ids = Ir.top_level_ids typedtree in
-  let top_bindings =
-    List.fold_left
-      (fun tbl (item : Typedtree.structure_item) ->
-        match item.str_desc with
-        | Tstr_value (_, bindings) ->
-          List.fold_left
-            (fun tbl (binding : Typedtree.value_binding) ->
-              match Typecore.id_of_pattern binding.vb_pat with
-              | Some id ->
-                Ident.add id
-                  {
-                    source_name = Ident.name id;
-                    source_expr = binding.vb_expr;
-                    source_loc = binding.vb_loc;
-                  }
-                  tbl
-              | None -> tbl)
-            tbl bindings
-        | _ -> tbl)
-      Ident.empty typedtree.str_items
-  in
-  let context target_type =
+  let top_bindings = top_bindings_of_typedtree typedtree in
+  ( top_ids,
     {
       top_bindings;
       top_ids;
       cache = Ident.empty;
       used_top = IdentSet.empty;
       target_type;
+      active_types = [];
       type_env = typedtree.str_final_env;
-    }
+    } )
+
+let marker_payload_of_typedtree ~(typedtree : Typedtree.structure) ~marker_name
+    =
+  List.find_map
+    (fun (item : Typedtree.structure_item) ->
+      match item.str_desc with
+      | Tstr_value (_, bindings) ->
+        List.find_map
+          (fun (binding : Typedtree.value_binding) ->
+            match
+              (Typecore.id_of_pattern binding.vb_pat, binding.vb_expr.exp_desc)
+            with
+            | ( Some id,
+                Texp_apply
+                  {
+                    funct =
+                      {
+                        exp_desc =
+                          Texp_ident
+                            ( _,
+                              {
+                                txt =
+                                  Longident.Ldot
+                                    (Longident.Lident "Comptime", "__marker");
+                                _;
+                              },
+                              _ );
+                        _;
+                      };
+                    args = [(_, Some payload)];
+                    _;
+                  } )
+              when Ident.name id = marker_name ->
+              Some payload
+            | _ -> None)
+          bindings
+      | _ -> None)
+    typedtree.str_items
+
+let eval_generated_type ~typedtree ~marker_name =
+  let () = stage_expression_ref := stage_expression_impl in
+  let top_ids, ctx = context_of_typedtree ~typedtree ~target_type:None in
+  match marker_payload_of_typedtree ~typedtree ~marker_name with
+  | None ->
+    errorf ~loc:Location.none "Failed to locate comptime marker `%s`"
+      marker_name
+  | Some payload ->
+    let value =
+      stage_expression ctx Ident.empty (Ir.lower_expr top_ids payload)
+    in
+    generated_type_of_value ~loc:payload.exp_loc value
+
+let eval_decls ~typedtree ~marker_name ~target_type =
+  let () = stage_expression_ref := stage_expression_impl in
+  let top_ids, ctx =
+    context_of_typedtree ~typedtree ~target_type:(Some target_type)
   in
+  match marker_payload_of_typedtree ~typedtree ~marker_name with
+  | None ->
+    errorf ~loc:Location.none "Failed to locate attached comptime marker `%s`"
+      marker_name
+  | Some payload ->
+    let value =
+      stage_expression ctx Ident.empty (Ir.lower_expr top_ids payload)
+    in
+    ( structure_items_of_generated_decls ~loc:payload.exp_loc ctx
+        (generated_decl_list_of_value ~loc:payload.exp_loc value),
+      ctx.used_top )
+
+let rewrite ~typedtree ast =
+  let () = stage_expression_ref := stage_expression_impl in
+  let top_ids, base_context =
+    context_of_typedtree ~typedtree ~target_type:None
+  in
+  let context target_type = {base_context with target_type} in
   let replacements = Hashtbl.create 8 in
   List.iter
     (fun (item : Typedtree.structure_item) ->
@@ -2065,42 +2637,40 @@ let rewrite ~typedtree ast =
           bindings
       | _ -> ())
     typedtree.str_items;
-  if Hashtbl.length replacements = 0 then None
-  else
-    let used_top =
-      Hashtbl.fold
-        (fun _ (_expr, used) acc -> IdentSet.union used acc)
-        replacements IdentSet.empty
-    in
-    let ast =
-      List.filter_map
-        (fun item ->
-          if
-            is_surface_module item
-            || is_surface_dict_module item
-            || is_comptime_open item
-          then None
-          else
-            match item.pstr_desc with
-            | Pstr_value (rec_flag, bindings) ->
-              let bindings =
-                List.filter_map
-                  (fun vb ->
-                    match parsetree_binding_name_from_pattern vb.pvb_pat with
-                    | Some txt ->
-                      if Hashtbl.mem replacements txt then
-                        let expr, _used = Hashtbl.find replacements txt in
-                        Some {vb with pvb_expr = expr}
-                      else if
-                        IdentSet.exists (fun id -> Ident.name id = txt) used_top
-                      then None
-                      else Some vb
-                    | None -> Some vb)
-                  bindings
-              in
-              if bindings = [] then None
-              else Some {item with pstr_desc = Pstr_value (rec_flag, bindings)}
-            | _ -> Some item)
-        ast
-    in
-    Some ast
+  let used_top =
+    Hashtbl.fold
+      (fun _ (_expr, used) acc -> IdentSet.union used acc)
+      replacements IdentSet.empty
+  in
+  let rewritten_ast =
+    List.filter_map
+      (fun item ->
+        if
+          is_surface_module item
+          || is_surface_dict_module item
+          || is_comptime_open item
+        then None
+        else
+          match item.pstr_desc with
+          | Pstr_value (rec_flag, bindings) ->
+            let bindings =
+              List.filter_map
+                (fun vb ->
+                  match parsetree_binding_name_from_pattern vb.pvb_pat with
+                  | Some txt ->
+                    if Hashtbl.mem replacements txt then
+                      let expr, _used = Hashtbl.find replacements txt in
+                      Some {vb with pvb_expr = expr}
+                    else if
+                      IdentSet.exists (fun id -> Ident.name id = txt) used_top
+                    then None
+                    else Some vb
+                  | None -> Some vb)
+                bindings
+            in
+            if bindings = [] then None
+            else Some {item with pstr_desc = Pstr_value (rec_flag, bindings)}
+          | _ -> Some item)
+      ast
+  in
+  if rewritten_ast = ast then None else Some rewritten_ast

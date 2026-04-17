@@ -6,6 +6,8 @@ open Asttypes
 open Longident
 open Parsetree
 
+module GeneratedEnv = Map.Make (String)
+
 let errorf ~loc fmt =
   Format.kasprintf (fun message -> Location.raise_errorf ~loc "%s" message) fmt
 
@@ -81,6 +83,42 @@ let constructor_make_expr ctor_expr arg_expr =
     (Exp.ident
        (Location.mknoloc (Ldot (Lident "Comptime", "__constructorMake"))))
     [(Nolabel, ctor_expr); (Nolabel, arg_expr)]
+
+let witness_manifest_of_module_expr mod_expr =
+  match mod_expr.pmod_desc with
+  | Pmod_structure
+      [
+        {
+          pstr_desc =
+            Pstr_type
+              ( Nonrecursive,
+                [
+                  {
+                    ptype_name = {txt = "t"; _};
+                    ptype_params = [];
+                    ptype_kind = Ptype_abstract;
+                    ptype_manifest = Some manifest;
+                    _;
+                  };
+                ] );
+          _;
+        };
+      ] ->
+    Some manifest
+  | _ -> None
+
+let add_witness_constraint expr manifest =
+  Exp.constraint_ expr
+    (Typ.package
+       (Location.mknoloc (Lident "Witness"))
+       [(Location.mknoloc (Lident "t"), manifest)])
+
+let generated_ident name =
+  Exp.ident (Location.mknoloc (Ldot (Lident "Comptime", name)))
+
+let generated_apply name args = Exp.apply (generated_ident name) args
+
+let generated_constant name = generated_ident name
 
 let classify_typ_scrutinee expr =
   match expr.pexp_desc with
@@ -508,6 +546,12 @@ let needs_comptime_surface structure =
             found := true
           | _ -> ());
           Ast_iterator.default_iterator.expr self expr);
+      typ =
+        (fun self ct ->
+          (match ct.ptyp_desc with
+          | Ptyp_extension ({txt = "comptime"; _}, _) -> found := true
+          | _ -> ());
+          Ast_iterator.default_iterator.typ self ct);
     }
   in
   iterator.structure iterator structure;
@@ -517,14 +561,32 @@ let comptime_surface_source =
   {|
 /* [@@@warning "-30"] */
 
-module Dict = {
-  external make: unit => 'a = "comptime_dict_make"
-  external copy: 'a => 'a = "comptime_dict_copy"
-  external set: ('a, 'key, 'b) => unit = "comptime_dict_set"
-  external get: ('a, string) => option<'b> = "comptime_dict_get"
-}
-
 module Comptime = {
+  module type Witness = {
+    type t
+  }
+
+  module Dict = {
+    external make: unit => 'a = "comptime_dict_make"
+    external copy: 'a => 'a = "comptime_dict_copy"
+    external set: ('a, 'key, 'b) => unit = "comptime_dict_set"
+    external get: ('a, string) => option<'b> = "comptime_dict_get"
+  }
+
+  type generatedType
+  type generatedField
+  type generatedConstructor
+  type generatedPayload
+
+  external generatedTuple: array<'a> => generatedType = "comptime_type_tuple"
+  external generatedRecord: array<'a> => generatedType = "comptime_type_record"
+  external generatedVariant: array<'a> => generatedType = "comptime_type_variant"
+  external generatedField: (string, 'a) => generatedField = "comptime_type_field"
+  external generatedConstructor: (string, 'a) => generatedConstructor = "comptime_type_constructor"
+  external generatedNoPayload: generatedPayload = "comptime_type_no_payload"
+  external generatedSingle: 'a => generatedPayload = "comptime_type_single_payload"
+  external generatedTuplePayload: array<'a> => generatedPayload = "comptime_type_tuple_payload"
+
   type rec field<'r> =
     | StringField({fieldName: string, fieldGet: 'r => string}): field<'r>
     | IntField({fieldName: string, fieldGet: 'r => int}): field<'r>
@@ -596,6 +658,23 @@ module Comptime = {
 
   external reflect: unit => typeDesc<'a> = "%identity"
   external __marker: 'a => 'a = "%identity"
+  type __generatedType
+  type __generatedPayload
+  external __generatedString: __generatedType = "comptime_type_string"
+  external __generatedInt: __generatedType = "comptime_type_int"
+  external __generatedFloat: __generatedType = "comptime_type_float"
+  external __generatedBool: __generatedType = "comptime_type_bool"
+  external __generatedJson: __generatedType = "comptime_type_json"
+  external __generatedOption: __generatedType => __generatedType = "comptime_type_option"
+  external __generatedArray: __generatedType => __generatedType = "comptime_type_array"
+  external __generatedList: __generatedType => __generatedType = "comptime_type_list"
+  external __generatedTuple: array<'a> => __generatedType = "comptime_type_tuple"
+  external __generatedRecord: array<'a> => __generatedType = "comptime_type_record"
+  external __generatedVariant: array<'a> => __generatedType = "comptime_type_variant"
+  external __generatedNoPayload: __generatedPayload = "comptime_type_no_payload"
+  external __generatedSinglePayload: __generatedType => __generatedPayload = "comptime_type_single_payload"
+  external __generatedTuplePayload: array<'a> => __generatedPayload = "comptime_type_tuple_payload"
+  external __generatedOfDesc: typeDesc<'a> => __generatedType = "comptime_type_of_desc"
   external __fieldType: field<'r> => typeDesc<'a> = "comptime_field_type"
   external __fieldName: field<'r> => string = "comptime_field_name"
   external __fieldGet: (field<'r>, 'r) => 'a = "comptime_field_get"
@@ -622,6 +701,21 @@ let rewrite (ast : structure) : structure =
   let mapper =
     {
       default_mapper with
+      structure_item =
+        (fun self item ->
+          let item = default_mapper.structure_item self item in
+          match item.pstr_desc with
+          | Pstr_open
+              ({
+                 popen_lid = {txt = Lident "Comptime"; _};
+                 popen_override = Fresh;
+                 _;
+               } as open_decl) ->
+            {
+              item with
+              pstr_desc = Pstr_open {open_decl with popen_override = Override};
+            }
+          | _ -> item);
       expr =
         (fun self expr ->
           match expr.pexp_desc with
@@ -781,6 +875,14 @@ let rewrite (ast : structure) : structure =
               } ->
             constructor_make_expr (self.expr self ctor_expr)
               (self.expr self arg)
+          | Pexp_pack _ -> (
+            let expr = default_mapper.expr self expr in
+            match expr.pexp_desc with
+            | Pexp_pack mod_expr -> (
+              match witness_manifest_of_module_expr mod_expr with
+              | Some manifest -> add_witness_constraint expr manifest
+              | None -> expr)
+            | _ -> expr)
           | _ -> default_mapper.expr self expr);
       typ =
         (fun self ct ->
@@ -793,3 +895,653 @@ let rewrite (ast : structure) : structure =
   in
   let ast = mapper.structure mapper ast in
   if needs_comptime_surface ast then comptime_surface_items () @ ast else ast
+
+type generated_kind =
+  | Gk_type
+  | Gk_type_array
+  | Gk_payload
+  | Gk_field_array
+  | Gk_constructor_array
+
+let rec surface_binding_name_from_pattern pat =
+  match pat.ppat_desc with
+  | Ppat_var {txt; _} -> Some txt
+  | Ppat_constraint (pat, _) | Ppat_alias (pat, _) ->
+    surface_binding_name_from_pattern pat
+  | _ -> None
+
+let rec strip_constraint expr =
+  match expr.pexp_desc with
+  | Pexp_constraint (expr, _) -> strip_constraint expr
+  | _ -> expr
+
+let expr_is_ident name expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_ident {txt = Lident txt; _} -> txt = name
+  | Pexp_ident {txt = Ldot (Lident "Comptime", txt); _} -> txt = name
+  | _ -> false
+
+let expr_is_array_map expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_apply
+      {
+        funct =
+          {pexp_desc = Pexp_ident {txt = Ldot (Lident "Array", "map"); _}; _};
+        args = [(Nolabel, source); (Nolabel, callback)];
+        _;
+      } ->
+    Some (source, callback)
+  | _ -> None
+
+let find_record_field_expr ~label expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_record (fields, None) -> (
+    match
+      List.find_opt
+        (fun field ->
+          match field.lid.txt with
+          | Lident name -> name = label
+          | _ -> false)
+        fields
+    with
+    | Some field -> Some field.x
+    | None -> None)
+  | _ -> None
+
+let rebuild_record_field ~label ~value fields =
+  List.map
+    (fun field ->
+      match field.lid.txt with
+      | Lident name when name = label -> {field with x = value}
+      | _ -> field)
+    fields
+
+let is_hidden_generated_type_expr expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_ident {txt = Ldot (Lident "Comptime", name); _} ->
+    List.mem name
+      [
+        "__generatedString";
+        "__generatedInt";
+        "__generatedFloat";
+        "__generatedBool";
+        "__generatedJson";
+      ]
+  | Pexp_apply
+      {
+        funct =
+          {pexp_desc = Pexp_ident {txt = Ldot (Lident "Comptime", name); _}; _};
+        _;
+      } ->
+    List.mem name
+      [
+        "__generatedOption";
+        "__generatedArray";
+        "__generatedList";
+        "__generatedTuple";
+        "__generatedRecord";
+        "__generatedVariant";
+        "__generatedOfDesc";
+      ]
+  | _ -> false
+
+let is_hidden_generated_payload_expr expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "__generatedNoPayload"); _} ->
+    true
+  | Pexp_apply
+      {
+        funct =
+          {
+            pexp_desc =
+              Pexp_ident
+                {txt = Ldot (Lident "Comptime", "__generatedSinglePayload"); _};
+            _;
+          };
+        _;
+      } ->
+    true
+  | Pexp_apply
+      {
+        funct =
+          {
+            pexp_desc =
+              Pexp_ident
+                {txt = Ldot (Lident "Comptime", "__generatedTuplePayload"); _};
+            _;
+          };
+        _;
+      } ->
+    true
+  | _ -> false
+
+let consistent_generated_kind kinds =
+  match kinds with
+  | [] -> None
+  | first :: rest ->
+    if List.for_all (fun kind -> kind = first) rest then Some first else None
+
+let consistent_generated_kind_options kinds =
+  if List.for_all Option.is_some kinds then
+    consistent_generated_kind (List.filter_map (fun kind -> kind) kinds)
+  else None
+
+let expr_is_failwith expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_apply
+      {
+        funct =
+          {
+            pexp_desc =
+              Pexp_ident
+                ( {txt = Lident "failwith"; _}
+                | {txt = Ldot (Lident "Comptime", "failwith"); _} );
+            _;
+          };
+        _;
+      } ->
+    true
+  | _ -> false
+
+let infer_type_constructor_kind expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_construct ({txt = Lident name; _}, _)
+    when List.mem name
+           [
+             "String";
+             "Int";
+             "Float";
+             "Bool";
+             "Json";
+             "Option";
+             "Array";
+             "List";
+             "Tuple";
+             "Record";
+             "Variant";
+           ] ->
+    Some Gk_type
+  | _ -> None
+
+let rec is_generated_field_expr expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_construct ({txt = Lident "Field"; _}, Some payload) ->
+    is_generated_field_expr payload
+  | Pexp_record (fields, None) ->
+    List.length fields = 2
+    && List.exists
+         (fun field ->
+           match field.lid.txt with
+           | Lident "name" -> true
+           | _ -> false)
+         fields
+    && List.exists
+         (fun field ->
+           match field.lid.txt with
+           | Lident "typ" -> true
+           | _ -> false)
+         fields
+  | _ -> false
+
+let rec is_generated_constructor_expr expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_construct ({txt = Lident "Constructor"; _}, Some payload) ->
+    is_generated_constructor_expr payload
+  | Pexp_record (fields, None) ->
+    List.length fields = 2
+    && List.exists
+         (fun field ->
+           match field.lid.txt with
+           | Lident "name" -> true
+           | _ -> false)
+         fields
+    && List.exists
+         (fun field ->
+           match field.lid.txt with
+           | Lident "payload" -> true
+           | _ -> false)
+         fields
+  | _ -> false
+
+let rec infer_generated_kind env expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_ident {txt = Lident name; _} -> GeneratedEnv.find_opt name env
+  | Pexp_fun {rhs; _} -> infer_generated_kind env rhs
+  | Pexp_let (_rec_flag, bindings, body) ->
+    let env =
+      List.fold_left
+        (fun env binding ->
+          match surface_binding_name_from_pattern binding.pvb_pat with
+          | Some name -> (
+            match infer_generated_kind env binding.pvb_expr with
+            | Some kind -> GeneratedEnv.add name kind env
+            | None -> env)
+          | None -> env)
+        env bindings
+    in
+    infer_generated_kind env body
+  | Pexp_ifthenelse (_condition, when_true, Some when_false) ->
+    consistent_generated_kind_branches env [when_true; when_false]
+  | Pexp_match (_scrutinee, cases) ->
+    consistent_generated_kind_branches env
+      (List.map (fun case -> case.pc_rhs) cases)
+  | Pexp_sequence (_first, second) -> infer_generated_kind env second
+  | Pexp_array [] -> None
+  | Pexp_array (first :: rest) -> (
+    match infer_generated_kind env first with
+    | Some kind
+      when List.for_all
+             (fun expr -> infer_generated_kind env expr = Some kind)
+             rest ->
+      Some
+        (match kind with
+        | Gk_type -> Gk_type_array
+        | _ -> kind)
+    | None
+      when is_generated_field_expr first
+           && List.for_all is_generated_field_expr rest ->
+      Some Gk_field_array
+    | None
+      when is_generated_constructor_expr first
+           && List.for_all is_generated_constructor_expr rest ->
+      Some Gk_constructor_array
+    | _ -> None)
+  | Pexp_apply _ -> (
+    match expr_is_array_map expr with
+    | Some (_source, callback) -> (
+      match (strip_constraint callback).pexp_desc with
+      | Pexp_fun {rhs; _} -> (
+        match infer_generated_kind env rhs with
+        | Some Gk_type -> Some Gk_type_array
+        | Some kind -> Some kind
+        | None when is_generated_field_expr rhs -> Some Gk_field_array
+        | None when is_generated_constructor_expr rhs ->
+          Some Gk_constructor_array
+        | _ -> None)
+      | _ -> None)
+    | None -> (
+      match (strip_constraint expr).pexp_desc with
+      | Pexp_apply
+          {funct = {pexp_desc = Pexp_ident {txt = Lident name; _}; _}; _} ->
+        GeneratedEnv.find_opt name env
+      | Pexp_apply
+          {
+            funct =
+              {
+                pexp_desc = Pexp_ident {txt = Ldot (Lident "Comptime", name); _};
+                _;
+              };
+            _;
+          }
+        when List.mem name
+               [
+                 "__generatedOption";
+                 "__generatedArray";
+                 "__generatedList";
+                 "__generatedTuple";
+                 "__generatedRecord";
+                 "__generatedVariant";
+                 "__generatedOfDesc";
+               ] ->
+        Some Gk_type
+      | Pexp_apply
+          {
+            funct =
+              {
+                pexp_desc =
+                  Pexp_ident
+                    {
+                      txt = Ldot (Lident "Comptime", "__generatedSinglePayload");
+                      _;
+                    };
+                _;
+              };
+            _;
+          } ->
+        Some Gk_payload
+      | Pexp_apply
+          {
+            funct =
+              {
+                pexp_desc =
+                  Pexp_ident
+                    {
+                      txt = Ldot (Lident "Comptime", "__generatedTuplePayload");
+                      _;
+                    };
+                _;
+              };
+            _;
+          } ->
+        Some Gk_payload
+      | _ -> None))
+  | Pexp_ident {txt = Ldot (Lident "Comptime", "__generatedNoPayload"); _} ->
+    Some Gk_payload
+  | Pexp_construct ({txt = Lident "NoPayload"; _}, _)
+  | Pexp_construct ({txt = Lident "Single"; _}, _) ->
+    Some Gk_payload
+  | Pexp_construct ({txt = Lident "Tuple"; _}, Some payload)
+    when Option.is_some (find_record_field_expr ~label:"items" payload) ->
+    Some Gk_type
+  | _ -> infer_type_constructor_kind expr
+
+and consistent_generated_kind_branches env branches =
+  let rec loop inferred = function
+    | [] -> consistent_generated_kind (List.rev inferred)
+    | branch :: rest -> (
+      match infer_generated_kind env branch with
+      | Some kind -> loop (kind :: inferred) rest
+      | None when expr_is_failwith branch -> loop inferred rest
+      | None -> None)
+  in
+  loop [] branches
+
+let rewrite_callback_body rewrite env callback =
+  match callback.pexp_desc with
+  | Pexp_fun f ->
+    {callback with pexp_desc = Pexp_fun {f with rhs = rewrite env f.rhs}}
+  | _ -> callback
+
+let rec rewrite_generated_binding env expr =
+  match infer_generated_kind env expr with
+  | Some Gk_type -> rewrite_generated_type_expr env expr
+  | Some Gk_type_array -> rewrite_generated_type_array_expr env expr
+  | Some Gk_payload -> rewrite_generated_payload_expr env expr
+  | Some Gk_field_array -> rewrite_generated_field_array_expr env expr
+  | Some Gk_constructor_array ->
+    rewrite_generated_constructor_array_expr env expr
+  | None -> expr
+
+and rewrite_generated_bindings env bindings =
+  List.fold_left
+    (fun (env, acc) binding ->
+      let rewritten = rewrite_generated_binding env binding.pvb_expr in
+      let env =
+        match surface_binding_name_from_pattern binding.pvb_pat with
+        | Some name -> (
+          match infer_generated_kind env binding.pvb_expr with
+          | Some kind -> GeneratedEnv.add name kind env
+          | None -> env)
+        | None -> env
+      in
+      (env, acc @ [{binding with pvb_expr = rewritten}]))
+    (env, []) bindings
+
+and rewrite_generated_type_expr env expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_fun f ->
+    {
+      expr with
+      pexp_desc = Pexp_fun {f with rhs = rewrite_generated_type_expr env f.rhs};
+    }
+  | Pexp_let (rec_flag, bindings, body) ->
+    let env, bindings = rewrite_generated_bindings env bindings in
+    Exp.let_ rec_flag bindings (rewrite_generated_type_expr env body)
+  | Pexp_ifthenelse (a, b, c) ->
+    Exp.ifthenelse a
+      (rewrite_generated_type_expr env b)
+      (Option.map (rewrite_generated_type_expr env) c)
+  | Pexp_match (scrutinee, cases) ->
+    Exp.match_ scrutinee
+      (List.map
+         (fun case ->
+           {case with pc_rhs = rewrite_generated_type_expr env case.pc_rhs})
+         cases)
+  | Pexp_construct ({txt = Lident "String"; _}, None) ->
+    generated_constant "__generatedString"
+  | Pexp_construct ({txt = Lident "Int"; _}, None) ->
+    generated_constant "__generatedInt"
+  | Pexp_construct ({txt = Lident "Float"; _}, None) ->
+    generated_constant "__generatedFloat"
+  | Pexp_construct ({txt = Lident "Bool"; _}, None) ->
+    generated_constant "__generatedBool"
+  | Pexp_construct ({txt = Lident "Json"; _}, None) ->
+    generated_constant "__generatedJson"
+  | Pexp_construct ({txt = Lident "Option"; _}, Some inner) ->
+    generated_apply "__generatedOption"
+      [(Nolabel, rewrite_generated_type_expr env inner)]
+  | Pexp_construct ({txt = Lident "Array"; _}, Some inner) ->
+    generated_apply "__generatedArray"
+      [(Nolabel, rewrite_generated_type_expr env inner)]
+  | Pexp_construct ({txt = Lident "List"; _}, Some inner) ->
+    generated_apply "__generatedList"
+      [(Nolabel, rewrite_generated_type_expr env inner)]
+  | Pexp_construct ({txt = Lident "Tuple"; _}, Some payload) -> (
+    match find_record_field_expr ~label:"items" payload with
+    | Some items ->
+      generated_apply "__generatedTuple"
+        [(Nolabel, rewrite_generated_type_array_expr env items)]
+    | None ->
+      errorf ~loc:expr.pexp_loc
+        "Generated `Tuple` expressions must provide an `items` field")
+  | Pexp_construct ({txt = Lident "Record"; _}, Some payload) -> (
+    match find_record_field_expr ~label:"fields" payload with
+    | Some fields ->
+      generated_apply "__generatedRecord"
+        [(Nolabel, rewrite_generated_field_array_expr env fields)]
+    | None ->
+      errorf ~loc:expr.pexp_loc
+        "Generated `Record` expressions must provide a `fields` field")
+  | Pexp_construct ({txt = Lident "Variant"; _}, Some payload) -> (
+    match find_record_field_expr ~label:"constructors" payload with
+    | Some constructors ->
+      generated_apply "__generatedVariant"
+        [(Nolabel, rewrite_generated_constructor_array_expr env constructors)]
+    | None ->
+      errorf ~loc:expr.pexp_loc
+        "Generated `Variant` expressions must provide a `constructors` field")
+  | Pexp_apply
+      {
+        funct = {pexp_desc = Pexp_ident {txt = Lident name; _}; _} as funct;
+        args;
+        _;
+      }
+    when GeneratedEnv.find_opt name env = Some Gk_type ->
+    Exp.apply funct args
+  | Pexp_ident {txt = Lident name; _}
+    when GeneratedEnv.find_opt name env = Some Gk_type ->
+    expr
+  | _ when is_hidden_generated_type_expr expr -> expr
+  | _ -> generated_apply "__generatedOfDesc" [(Nolabel, expr)]
+
+and rewrite_generated_type_array_expr env expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_let (rec_flag, bindings, body) ->
+    let env, bindings = rewrite_generated_bindings env bindings in
+    Exp.let_ rec_flag bindings (rewrite_generated_type_array_expr env body)
+  | Pexp_ifthenelse (a, b, c) ->
+    Exp.ifthenelse a
+      (rewrite_generated_type_array_expr env b)
+      (Option.map (rewrite_generated_type_array_expr env) c)
+  | Pexp_match (scrutinee, cases) ->
+    Exp.match_ scrutinee
+      (List.map
+         (fun case ->
+           {
+             case with
+             pc_rhs = rewrite_generated_type_array_expr env case.pc_rhs;
+           })
+         cases)
+  | Pexp_array exprs ->
+    Exp.array (List.map (rewrite_generated_type_expr env) exprs)
+  | Pexp_ident {txt = Lident name; _}
+    when GeneratedEnv.find_opt name env = Some Gk_type_array ->
+    expr
+  | Pexp_apply _ -> (
+    match expr_is_array_map expr with
+    | Some (source, callback) ->
+      Exp.apply
+        (match (strip_constraint expr).pexp_desc with
+        | Pexp_apply {funct; _} -> funct
+        | _ -> assert false)
+        [
+          (Nolabel, source);
+          ( Nolabel,
+            rewrite_callback_body rewrite_generated_type_expr env callback );
+        ]
+    | None -> expr)
+  | _ -> expr
+
+and rewrite_generated_field_expr env expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_construct ({txt = Lident "Field"; _}, Some payload) ->
+    rewrite_generated_field_expr env payload
+  | Pexp_record (_, None) when is_generated_field_expr expr -> (
+    match
+      ( find_record_field_expr ~label:"name" expr,
+        find_record_field_expr ~label:"typ" expr )
+    with
+    | Some name, Some typ ->
+      generated_apply "generatedField"
+        [(Nolabel, name); (Nolabel, rewrite_generated_type_expr env typ)]
+    | _ -> expr)
+  | _ -> expr
+
+and rewrite_generated_field_array_expr env expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_let (rec_flag, bindings, body) ->
+    let env, bindings = rewrite_generated_bindings env bindings in
+    Exp.let_ rec_flag bindings (rewrite_generated_field_array_expr env body)
+  | Pexp_ifthenelse (a, b, c) ->
+    Exp.ifthenelse a
+      (rewrite_generated_field_array_expr env b)
+      (Option.map (rewrite_generated_field_array_expr env) c)
+  | Pexp_match (scrutinee, cases) ->
+    Exp.match_ scrutinee
+      (List.map
+         (fun case ->
+           {
+             case with
+             pc_rhs = rewrite_generated_field_array_expr env case.pc_rhs;
+           })
+         cases)
+  | Pexp_array exprs ->
+    Exp.array (List.map (rewrite_generated_field_expr env) exprs)
+  | Pexp_ident {txt = Lident name; _}
+    when GeneratedEnv.find_opt name env = Some Gk_field_array ->
+    expr
+  | Pexp_apply _ -> (
+    match expr_is_array_map expr with
+    | Some (source, callback) ->
+      Exp.apply
+        (match (strip_constraint expr).pexp_desc with
+        | Pexp_apply {funct; _} -> funct
+        | _ -> assert false)
+        [
+          (Nolabel, source);
+          ( Nolabel,
+            rewrite_callback_body rewrite_generated_field_expr env callback );
+        ]
+    | None -> expr)
+  | _ -> expr
+
+and rewrite_generated_payload_expr env expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_let (rec_flag, bindings, body) ->
+    let env, bindings = rewrite_generated_bindings env bindings in
+    Exp.let_ rec_flag bindings (rewrite_generated_payload_expr env body)
+  | Pexp_ifthenelse (a, b, c) ->
+    Exp.ifthenelse a
+      (rewrite_generated_payload_expr env b)
+      (Option.map (rewrite_generated_payload_expr env) c)
+  | Pexp_match (scrutinee, cases) ->
+    Exp.match_ scrutinee
+      (List.map
+         (fun case ->
+           {case with pc_rhs = rewrite_generated_payload_expr env case.pc_rhs})
+         cases)
+  | Pexp_construct ({txt = Lident "NoPayload"; _}, None) ->
+    generated_constant "__generatedNoPayload"
+  | Pexp_construct ({txt = Lident "Single"; _}, Some inner) ->
+    generated_apply "__generatedSinglePayload"
+      [(Nolabel, rewrite_generated_type_expr env inner)]
+  | Pexp_construct ({txt = Lident "Tuple"; _}, Some payload) -> (
+    match find_record_field_expr ~label:"items" payload with
+    | Some items ->
+      generated_apply "__generatedTuplePayload"
+        [(Nolabel, rewrite_generated_type_array_expr env items)]
+    | None ->
+      errorf ~loc:expr.pexp_loc
+        "Generated tuple payloads must provide an `items` field")
+  | Pexp_ident {txt = Lident name; _}
+    when GeneratedEnv.find_opt name env = Some Gk_payload ->
+    expr
+  | _ when is_hidden_generated_payload_expr expr -> expr
+  | _ -> expr
+
+and rewrite_generated_constructor_expr env expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_construct ({txt = Lident "Constructor"; _}, Some payload) ->
+    rewrite_generated_constructor_expr env payload
+  | Pexp_record (_, None) when is_generated_constructor_expr expr -> (
+    match
+      ( find_record_field_expr ~label:"name" expr,
+        find_record_field_expr ~label:"payload" expr )
+    with
+    | Some name, Some payload ->
+      generated_apply "generatedConstructor"
+        [(Nolabel, name); (Nolabel, rewrite_generated_payload_expr env payload)]
+    | _ -> expr)
+  | _ -> expr
+
+and rewrite_generated_constructor_array_expr env expr =
+  match (strip_constraint expr).pexp_desc with
+  | Pexp_let (rec_flag, bindings, body) ->
+    let env, bindings = rewrite_generated_bindings env bindings in
+    Exp.let_ rec_flag bindings
+      (rewrite_generated_constructor_array_expr env body)
+  | Pexp_ifthenelse (a, b, c) ->
+    Exp.ifthenelse a
+      (rewrite_generated_constructor_array_expr env b)
+      (Option.map (rewrite_generated_constructor_array_expr env) c)
+  | Pexp_match (scrutinee, cases) ->
+    Exp.match_ scrutinee
+      (List.map
+         (fun case ->
+           {
+             case with
+             pc_rhs = rewrite_generated_constructor_array_expr env case.pc_rhs;
+           })
+         cases)
+  | Pexp_array exprs ->
+    Exp.array (List.map (rewrite_generated_constructor_expr env) exprs)
+  | Pexp_ident {txt = Lident name; _}
+    when GeneratedEnv.find_opt name env = Some Gk_constructor_array ->
+    expr
+  | Pexp_apply _ -> (
+    match expr_is_array_map expr with
+    | Some (source, callback) ->
+      Exp.apply
+        (match (strip_constraint expr).pexp_desc with
+        | Pexp_apply {funct; _} -> funct
+        | _ -> assert false)
+        [
+          (Nolabel, source);
+          ( Nolabel,
+            rewrite_callback_body rewrite_generated_constructor_expr env
+              callback );
+        ]
+    | None -> expr)
+  | _ -> expr
+
+let rewrite_expr_in_surface expr =
+  let marker = "__comptime_type_expr" in
+  let ast =
+    rewrite
+      [Str.value Nonrecursive [Vb.mk (Pat.var (Location.mknoloc marker)) expr]]
+  in
+  List.find_map
+    (function
+      | {
+          pstr_desc =
+            Pstr_value
+              (_, [{pvb_pat = {ppat_desc = Ppat_var {txt; _}; _}; pvb_expr; _}]);
+          _;
+        }
+        when txt = marker ->
+        Some (rewrite_generated_type_expr GeneratedEnv.empty pvb_expr)
+      | _ -> None)
+    ast
+  |> Option.get
+
+let rewrite_type_generator_expr expr = rewrite_expr_in_surface expr
