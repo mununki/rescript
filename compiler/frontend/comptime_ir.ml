@@ -39,6 +39,7 @@ type builtin =
   | BTypeBool
   | BTypeJson
   | BTypeOption
+  | BTypeOptional
   | BTypeArray
   | BTypeList
   | BTypeTuple
@@ -142,6 +143,7 @@ let builtin_of_path path lid prims =
   | "comptime_type_bool" :: _ -> Some (IBuiltin (BTypeBool, Some lid))
   | "comptime_type_json" :: _ -> Some (IBuiltin (BTypeJson, Some lid))
   | "comptime_type_option" :: _ -> Some (IBuiltin (BTypeOption, Some lid))
+  | "comptime_type_optional" :: _ -> Some (IBuiltin (BTypeOptional, Some lid))
   | "comptime_type_array" :: _ -> Some (IBuiltin (BTypeArray, Some lid))
   | "comptime_type_list" :: _ -> Some (IBuiltin (BTypeList, Some lid))
   | "comptime_type_tuple" :: _ -> Some (IBuiltin (BTypeTuple, Some lid))

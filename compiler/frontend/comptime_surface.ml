@@ -666,6 +666,7 @@ module Comptime = {
   external __generatedBool: __generatedType = "comptime_type_bool"
   external __generatedJson: __generatedType = "comptime_type_json"
   external __generatedOption: __generatedType => __generatedType = "comptime_type_option"
+  external __generatedOptional: __generatedType => __generatedType = "comptime_type_optional"
   external __generatedArray: __generatedType => __generatedType = "comptime_type_array"
   external __generatedList: __generatedType => __generatedType = "comptime_type_list"
   external __generatedTuple: array<'a> => __generatedType = "comptime_type_tuple"
@@ -696,6 +697,652 @@ let comptime_surface_items () =
       ~source:comptime_surface_source
   in
   parsed.parsetree
+
+module BuilderEnv = Set.Make (String)
+
+type builder_env = {
+  builders: BuilderEnv.t;
+  dynamic_fields: BuilderEnv.t;
+  updaters: BuilderEnv.t;
+}
+
+let empty_builder_env =
+  {
+    builders = BuilderEnv.empty;
+    dynamic_fields = BuilderEnv.empty;
+    updaters = BuilderEnv.empty;
+  }
+
+let builder_env_add_builder name env =
+  {env with builders = BuilderEnv.add name env.builders}
+
+let builder_env_add_updater name env =
+  {env with updaters = BuilderEnv.add name env.updaters}
+
+let builder_env_add_dynamic_field name env =
+  if name = "field" then
+    {env with dynamic_fields = BuilderEnv.add name env.dynamic_fields}
+  else env
+
+let builder_env_has_builder name env = BuilderEnv.mem name env.builders
+
+let builder_env_has_dynamic_field name env =
+  BuilderEnv.mem name env.dynamic_fields
+
+let builder_env_has_updater name env = BuilderEnv.mem name env.updaters
+
+let rec builder_binding_name_from_pattern pat =
+  match pat.ppat_desc with
+  | Ppat_var {txt; _} -> Some txt
+  | Ppat_constraint (pat, _) -> builder_binding_name_from_pattern pat
+  | Ppat_alias (pat, {txt; _}) -> (
+    match builder_binding_name_from_pattern pat with
+    | Some name -> Some name
+    | None -> Some txt)
+  | _ -> None
+
+let rec builder_pattern_bound_names pat =
+  match pat.ppat_desc with
+  | Ppat_var {txt; _} -> [txt]
+  | Ppat_alias (pat, {txt; _}) -> txt :: builder_pattern_bound_names pat
+  | Ppat_constraint (pat, _) -> builder_pattern_bound_names pat
+  | Ppat_tuple pats | Ppat_array pats ->
+    List.concat_map builder_pattern_bound_names pats
+  | Ppat_record (fields, _) ->
+    List.concat_map (fun field -> builder_pattern_bound_names field.x) fields
+  | Ppat_construct (_, Some pat) | Ppat_variant (_, Some pat) ->
+    builder_pattern_bound_names pat
+  | Ppat_or (a, b) ->
+    builder_pattern_bound_names a @ builder_pattern_bound_names b
+  | _ -> []
+
+let builder_env_with_pattern pat env =
+  List.fold_left
+    (fun env name -> builder_env_add_dynamic_field name env)
+    env
+    (builder_pattern_bound_names pat)
+
+let pattern_binds_name pat name =
+  List.mem name (builder_pattern_bound_names pat)
+
+let rec builder_strip_constraint expr =
+  match expr.pexp_desc with
+  | Pexp_constraint (expr, _) -> builder_strip_constraint expr
+  | _ -> expr
+
+let is_unit_expr expr =
+  match (builder_strip_constraint expr).pexp_desc with
+  | Pexp_construct ({txt = Lident "()"; _}, None) -> true
+  | _ -> false
+
+let expr_is_record_seed expr =
+  match (builder_strip_constraint expr).pexp_desc with
+  | Pexp_apply
+      {
+        funct =
+          {
+            pexp_desc =
+              Pexp_ident
+                {txt = Lident "record" | Ldot (Lident "Comptime", "record"); _};
+            _;
+          };
+        args = [(Nolabel, arg)];
+        _;
+      } ->
+    is_unit_expr arg
+  | _ -> false
+
+let expr_is_empty_record_literal expr =
+  match (builder_strip_constraint expr).pexp_desc with
+  | Pexp_record ([], None) -> true
+  | _ -> false
+
+let expr_is_ident name expr =
+  match (builder_strip_constraint expr).pexp_desc with
+  | Pexp_ident {txt = Lident txt; _} -> txt = name
+  | _ -> false
+
+let fresh_builder_name =
+  let counter = ref 0 in
+  fun () ->
+    incr counter;
+    Printf.sprintf "__comptime_record_builder_%d" !counter
+
+let comptime_dict_ident name =
+  Exp.ident (Location.mknoloc (Ldot (Ldot (Lident "Comptime", "Dict"), name)))
+
+let dict_copy_expr expr =
+  Exp.apply (comptime_dict_ident "copy") [(Nolabel, expr)]
+
+let dict_make_expr () =
+  Exp.apply
+    (comptime_dict_ident "make")
+    [(Nolabel, Exp.construct (lid "()") None)]
+
+let dict_set_expr builder key value =
+  Exp.apply
+    (comptime_dict_ident "set")
+    [(Nolabel, builder); (Nolabel, key); (Nolabel, value)]
+
+let builder_record_key_expr env field =
+  match field.lid.txt with
+  | Lident name when builder_env_has_dynamic_field name env ->
+    Exp.ident (lid name)
+  | Lident name -> Exp.constant (Const.string name)
+  | _ ->
+    errorf ~loc:field.lid.loc
+      "Comptime record builders only support unqualified field labels"
+
+let lower_builder_record ~loc env spread fields =
+  let builder_name = fresh_builder_name () in
+  let builder_pat = Pat.var (Location.mknoloc builder_name) in
+  let builder_expr = Exp.ident (lid builder_name) in
+  let body =
+    List.fold_right
+      (fun field acc ->
+        Exp.sequence
+          (dict_set_expr builder_expr
+             (builder_record_key_expr env field)
+             field.x)
+          acc)
+      fields builder_expr
+  in
+  Exp.let_ ~loc Nonrecursive [Vb.mk builder_pat (dict_copy_expr spread)] body
+
+let rec builder_update_env_after_bindings env rec_flag bindings =
+  match rec_flag with
+  | Recursive ->
+    List.fold_left
+      (fun env binding ->
+        let bound_env = builder_env_with_pattern binding.pvb_pat env in
+        match
+          ( builder_binding_name_from_pattern binding.pvb_pat,
+            expr_has_builder_update bound_env binding.pvb_expr )
+        with
+        | Some name, true -> builder_env_add_updater name env
+        | _ -> env)
+      env bindings
+  | Nonrecursive ->
+    List.fold_left
+      (fun env binding ->
+        let bound_env = builder_env_with_pattern binding.pvb_pat env in
+        match
+          ( builder_binding_name_from_pattern binding.pvb_pat,
+            expr_has_builder_update bound_env binding.pvb_expr )
+        with
+        | Some name, true -> builder_env_add_updater name bound_env
+        | _ -> bound_env)
+      env bindings
+
+and expr_has_builder_update env expr =
+  match (builder_strip_constraint expr).pexp_desc with
+  | Pexp_ident {txt = Lident name; _} -> builder_env_has_updater name env
+  | Pexp_constraint (expr, _) -> expr_has_builder_update env expr
+  | Pexp_let (rec_flag, bindings, body) ->
+    let bindings_have_update =
+      List.exists
+        (fun binding ->
+          let bound_env = builder_env_with_pattern binding.pvb_pat env in
+          expr_has_builder_update bound_env binding.pvb_expr)
+        bindings
+    in
+    bindings_have_update
+    || expr_has_builder_update
+         (builder_update_env_after_bindings env rec_flag bindings)
+         body
+  | Pexp_fun f ->
+    expr_has_builder_update (builder_env_with_pattern f.lhs env) f.rhs
+  | Pexp_apply apply ->
+    expr_has_builder_update env apply.funct
+    || List.exists (fun (_, arg) -> expr_has_builder_update env arg) apply.args
+  | Pexp_match (scrutinee, cases) | Pexp_try (scrutinee, cases) ->
+    expr_has_builder_update env scrutinee
+    || List.exists
+         (fun case ->
+           let case_env = builder_env_with_pattern case.pc_lhs env in
+           Option.fold ~none:false
+             ~some:(expr_has_builder_update case_env)
+             case.pc_guard
+           || expr_has_builder_update case_env case.pc_rhs)
+         cases
+  | Pexp_ifthenelse (a, b, c) ->
+    expr_has_builder_update env a
+    || expr_has_builder_update env b
+    || Option.fold ~none:false ~some:(expr_has_builder_update env) c
+  | Pexp_sequence (a, b) ->
+    expr_has_builder_update env a || expr_has_builder_update env b
+  | Pexp_assert asserted -> expr_has_builder_update env asserted
+  | Pexp_newtype (_, body) | Pexp_open (_, _, body) | Pexp_letmodule (_, _, body)
+    ->
+    expr_has_builder_update env body
+  | Pexp_construct (_, payload) | Pexp_variant (_, payload) ->
+    Option.fold ~none:false ~some:(expr_has_builder_update env) payload
+  | Pexp_tuple exprs | Pexp_array exprs ->
+    List.exists (expr_has_builder_update env) exprs
+  | Pexp_record (fields, Some spread) ->
+    let has_dynamic_fields =
+      List.exists
+        (fun field ->
+          match field.lid.txt with
+          | Lident name -> builder_env_has_dynamic_field name env
+          | _ -> false)
+        fields
+    in
+    has_dynamic_fields
+    || expr_has_builder_update env spread
+    || List.exists (fun field -> expr_has_builder_update env field.x) fields
+  | Pexp_record (fields, None) ->
+    List.exists (fun field -> expr_has_builder_update env field.x) fields
+  | _ -> false
+
+and bindings_use_name_as_builder_seed env target bindings body =
+  match bindings with
+  | [] -> expr_uses_name_as_builder_seed env target body
+  | binding :: rest ->
+    let uses_in_expr =
+      expr_uses_name_as_builder_seed env target binding.pvb_expr
+    in
+    let bound_env = builder_env_with_pattern binding.pvb_pat env in
+    let env =
+      match
+        ( builder_binding_name_from_pattern binding.pvb_pat,
+          expr_has_builder_update bound_env binding.pvb_expr )
+      with
+      | Some name, true -> builder_env_add_updater name bound_env
+      | _ -> bound_env
+    in
+    if uses_in_expr then true
+    else if pattern_binds_name binding.pvb_pat target then false
+    else bindings_use_name_as_builder_seed env target rest body
+
+and expr_uses_name_as_builder_seed env target expr =
+  match (builder_strip_constraint expr).pexp_desc with
+  | Pexp_constraint (expr, _) -> expr_uses_name_as_builder_seed env target expr
+  | Pexp_ident _ | Pexp_constant _ -> false
+  | Pexp_let (rec_flag, bindings, body) ->
+    let uses_in_bindings =
+      match rec_flag with
+      | Recursive ->
+        List.exists
+          (fun binding ->
+            (not (pattern_binds_name binding.pvb_pat target))
+            && expr_uses_name_as_builder_seed env target binding.pvb_expr)
+          bindings
+      | Nonrecursive ->
+        bindings_use_name_as_builder_seed env target bindings body
+    in
+    if rec_flag = Recursive then
+      uses_in_bindings
+      ||
+      if
+        List.exists
+          (fun binding -> pattern_binds_name binding.pvb_pat target)
+          bindings
+      then false
+      else
+        expr_uses_name_as_builder_seed
+          (builder_update_env_after_bindings env rec_flag bindings)
+          target body
+    else uses_in_bindings
+  | Pexp_fun f ->
+    if pattern_binds_name f.lhs target then false
+    else
+      expr_uses_name_as_builder_seed
+        (builder_env_with_pattern f.lhs env)
+        target f.rhs
+  | Pexp_apply apply ->
+    expr_has_builder_update env apply.funct
+    && List.exists (fun (_, arg) -> expr_is_ident target arg) apply.args
+    || expr_uses_name_as_builder_seed env target apply.funct
+    || List.exists
+         (fun (_, arg) -> expr_uses_name_as_builder_seed env target arg)
+         apply.args
+  | Pexp_match (scrutinee, cases) | Pexp_try (scrutinee, cases) ->
+    expr_uses_name_as_builder_seed env target scrutinee
+    || List.exists
+         (fun case ->
+           if pattern_binds_name case.pc_lhs target then false
+           else
+             let case_env = builder_env_with_pattern case.pc_lhs env in
+             Option.fold ~none:false
+               ~some:(expr_uses_name_as_builder_seed case_env target)
+               case.pc_guard
+             || expr_uses_name_as_builder_seed case_env target case.pc_rhs)
+         cases
+  | Pexp_ifthenelse (a, b, c) ->
+    expr_uses_name_as_builder_seed env target a
+    || expr_uses_name_as_builder_seed env target b
+    || Option.fold ~none:false
+         ~some:(expr_uses_name_as_builder_seed env target)
+         c
+  | Pexp_sequence (a, b) ->
+    expr_uses_name_as_builder_seed env target a
+    || expr_uses_name_as_builder_seed env target b
+  | Pexp_assert asserted -> expr_uses_name_as_builder_seed env target asserted
+  | Pexp_newtype (_, body) | Pexp_open (_, _, body) | Pexp_letmodule (_, _, body)
+    ->
+    expr_uses_name_as_builder_seed env target body
+  | Pexp_construct (_, payload) | Pexp_variant (_, payload) ->
+    Option.fold ~none:false
+      ~some:(expr_uses_name_as_builder_seed env target)
+      payload
+  | Pexp_tuple exprs | Pexp_array exprs ->
+    List.exists (expr_uses_name_as_builder_seed env target) exprs
+  | Pexp_record (fields, Some spread) ->
+    let has_dynamic_fields =
+      List.exists
+        (fun field ->
+          match field.lid.txt with
+          | Lident name -> builder_env_has_dynamic_field name env
+          | _ -> false)
+        fields
+    in
+    (has_dynamic_fields && expr_is_ident target spread)
+    || expr_uses_name_as_builder_seed env target spread
+    || List.exists
+         (fun field -> expr_uses_name_as_builder_seed env target field.x)
+         fields
+  | Pexp_record (fields, None) ->
+    List.exists
+      (fun field -> expr_uses_name_as_builder_seed env target field.x)
+      fields
+  | _ -> false
+
+let builder_seed_names_for_nonrecursive_let env bindings body =
+  let rec collect_seed_names env bindings =
+    match bindings with
+    | [] -> BuilderEnv.empty
+    | binding :: rest -> (
+      let bound_env = builder_env_with_pattern binding.pvb_pat env in
+      let env_after_updates =
+        match
+          ( builder_binding_name_from_pattern binding.pvb_pat,
+            expr_has_builder_update bound_env binding.pvb_expr )
+        with
+        | Some name, true -> builder_env_add_updater name bound_env
+        | _ -> bound_env
+      in
+      let rest_seed_names = collect_seed_names env_after_updates rest in
+      match builder_binding_name_from_pattern binding.pvb_pat with
+      | Some name
+        when expr_is_empty_record_literal binding.pvb_expr
+             && bindings_use_name_as_builder_seed env_after_updates name rest
+                  body ->
+        BuilderEnv.add name rest_seed_names
+      | _ -> rest_seed_names)
+  in
+  collect_seed_names env bindings
+
+let rec rewrite_builder_bindings env rec_flag bindings =
+  match rec_flag with
+  | Recursive ->
+    let bindings =
+      List.map
+        (fun binding ->
+          let bound_env = builder_env_with_pattern binding.pvb_pat env in
+          let expr, is_builder =
+            rewrite_builder_expr bound_env binding.pvb_expr
+          in
+          let has_update = expr_has_builder_update bound_env binding.pvb_expr in
+          ({binding with pvb_expr = expr}, is_builder, has_update))
+        bindings
+    in
+    let env =
+      List.fold_left
+        (fun env (binding, is_builder, has_update) ->
+          match
+            ( builder_binding_name_from_pattern binding.pvb_pat,
+              is_builder,
+              has_update )
+          with
+          | Some name, true, _ -> builder_env_add_builder name env
+          | Some name, false, true -> builder_env_add_updater name env
+          | _ -> env)
+        env bindings
+    in
+    (env, List.map (fun (binding, _, _) -> binding) bindings)
+  | Nonrecursive ->
+    List.fold_left
+      (fun (env, acc) binding ->
+        let bound_env = builder_env_with_pattern binding.pvb_pat env in
+        let expr, is_builder =
+          rewrite_builder_expr bound_env binding.pvb_expr
+        in
+        let has_update = expr_has_builder_update bound_env binding.pvb_expr in
+        let binding = {binding with pvb_expr = expr} in
+        let env =
+          match
+            ( builder_binding_name_from_pattern binding.pvb_pat,
+              is_builder,
+              has_update )
+          with
+          | Some name, true, _ -> builder_env_add_builder name bound_env
+          | Some name, false, true -> builder_env_add_updater name bound_env
+          | _ -> bound_env
+        in
+        (env, acc @ [binding]))
+      (env, []) bindings
+
+and rewrite_builder_case env case =
+  let case_env = builder_env_with_pattern case.pc_lhs env in
+  let guard =
+    Option.map
+      (fun guard -> fst (rewrite_builder_expr case_env guard))
+      case.pc_guard
+  in
+  let rhs, is_builder = rewrite_builder_expr case_env case.pc_rhs in
+  ({case with pc_guard = guard; pc_rhs = rhs}, is_builder)
+
+and rewrite_builder_expr env expr =
+  if expr_is_record_seed expr then (expr, true)
+  else
+    match expr.pexp_desc with
+    | Pexp_ident {txt = Lident name; _} when builder_env_has_builder name env ->
+      (expr, true)
+    | Pexp_constraint (inner, typ) ->
+      let inner, is_builder = rewrite_builder_expr env inner in
+      ({expr with pexp_desc = Pexp_constraint (inner, typ)}, is_builder)
+    | Pexp_let (Nonrecursive, bindings, body) ->
+      let seed_names =
+        builder_seed_names_for_nonrecursive_let env bindings body
+      in
+      let env, bindings =
+        List.fold_left
+          (fun (env, acc) binding ->
+            let bound_env = builder_env_with_pattern binding.pvb_pat env in
+            let name = builder_binding_name_from_pattern binding.pvb_pat in
+            let has_update =
+              expr_has_builder_update bound_env binding.pvb_expr
+            in
+            let expr, is_builder =
+              match name with
+              | Some name when BuilderEnv.mem name seed_names ->
+                (dict_make_expr (), true)
+              | _ -> rewrite_builder_expr bound_env binding.pvb_expr
+            in
+            let binding = {binding with pvb_expr = expr} in
+            let env =
+              match (name, is_builder) with
+              | Some name, true -> builder_env_add_builder name bound_env
+              | _ -> bound_env
+            in
+            let env =
+              match (name, has_update) with
+              | Some name, true -> builder_env_add_updater name env
+              | _ -> env
+            in
+            (env, acc @ [binding]))
+          (env, []) bindings
+      in
+      let body, is_builder = rewrite_builder_expr env body in
+      ( {expr with pexp_desc = Pexp_let (Nonrecursive, bindings, body)},
+        is_builder )
+    | Pexp_let (rec_flag, bindings, body) ->
+      let env, bindings = rewrite_builder_bindings env rec_flag bindings in
+      let body, is_builder = rewrite_builder_expr env body in
+      ({expr with pexp_desc = Pexp_let (rec_flag, bindings, body)}, is_builder)
+    | Pexp_fun f ->
+      let env = builder_env_with_pattern f.lhs env in
+      let rhs, _ = rewrite_builder_expr env f.rhs in
+      ({expr with pexp_desc = Pexp_fun {f with rhs}}, false)
+    | Pexp_apply apply ->
+      let fn, _ = rewrite_builder_expr env apply.funct in
+      let args =
+        List.map
+          (fun (label, arg) ->
+            let arg, _ = rewrite_builder_expr env arg in
+            (label, arg))
+          apply.args
+      in
+      ({expr with pexp_desc = Pexp_apply {apply with funct = fn; args}}, false)
+    | Pexp_match (scrutinee, cases) ->
+      let scrutinee, _ = rewrite_builder_expr env scrutinee in
+      let cases = List.map (rewrite_builder_case env) cases in
+      let is_builder = cases <> [] && List.for_all snd cases in
+      ( {expr with pexp_desc = Pexp_match (scrutinee, List.map fst cases)},
+        is_builder )
+    | Pexp_try (scrutinee, cases) ->
+      let scrutinee, _ = rewrite_builder_expr env scrutinee in
+      let cases = List.map (rewrite_builder_case env) cases in
+      ({expr with pexp_desc = Pexp_try (scrutinee, List.map fst cases)}, false)
+    | Pexp_ifthenelse (a, b, c) ->
+      let a, _ = rewrite_builder_expr env a in
+      let b, b_builder = rewrite_builder_expr env b in
+      let c, c_builder =
+        match c with
+        | Some expr ->
+          let expr, is_builder = rewrite_builder_expr env expr in
+          (Some expr, is_builder)
+        | None -> (None, false)
+      in
+      ({expr with pexp_desc = Pexp_ifthenelse (a, b, c)}, b_builder && c_builder)
+    | Pexp_sequence (a, b) ->
+      let a, _ = rewrite_builder_expr env a in
+      let b, is_builder = rewrite_builder_expr env b in
+      ({expr with pexp_desc = Pexp_sequence (a, b)}, is_builder)
+    | Pexp_assert asserted ->
+      let asserted, _ = rewrite_builder_expr env asserted in
+      ({expr with pexp_desc = Pexp_assert asserted}, false)
+    | Pexp_newtype (name, body) ->
+      let body, is_builder = rewrite_builder_expr env body in
+      ({expr with pexp_desc = Pexp_newtype (name, body)}, is_builder)
+    | Pexp_open (override, lid, body) ->
+      let body, is_builder = rewrite_builder_expr env body in
+      ({expr with pexp_desc = Pexp_open (override, lid, body)}, is_builder)
+    | Pexp_letmodule (name, mod_expr, body) ->
+      let body, is_builder = rewrite_builder_expr env body in
+      ({expr with pexp_desc = Pexp_letmodule (name, mod_expr, body)}, is_builder)
+    | Pexp_construct (lid, payload) ->
+      let payload =
+        Option.map
+          (fun payload -> fst (rewrite_builder_expr env payload))
+          payload
+      in
+      ({expr with pexp_desc = Pexp_construct (lid, payload)}, false)
+    | Pexp_tuple exprs ->
+      let exprs =
+        List.map (fun expr -> fst (rewrite_builder_expr env expr)) exprs
+      in
+      ({expr with pexp_desc = Pexp_tuple exprs}, false)
+    | Pexp_array exprs ->
+      let exprs =
+        List.map (fun expr -> fst (rewrite_builder_expr env expr)) exprs
+      in
+      ({expr with pexp_desc = Pexp_array exprs}, false)
+    | Pexp_record (fields, Some spread) ->
+      let fields =
+        List.map
+          (fun field ->
+            let value, _ = rewrite_builder_expr env field.x in
+            {field with x = value})
+          fields
+      in
+      let spread, spread_is_builder = rewrite_builder_expr env spread in
+      let has_dynamic_fields =
+        List.exists
+          (fun field ->
+            match field.lid.txt with
+            | Lident name -> builder_env_has_dynamic_field name env
+            | _ -> false)
+          fields
+      in
+      if has_dynamic_fields || spread_is_builder then
+        (lower_builder_record ~loc:expr.pexp_loc env spread fields, true)
+      else ({expr with pexp_desc = Pexp_record (fields, Some spread)}, false)
+    | Pexp_record (fields, None) ->
+      let fields =
+        List.map
+          (fun field ->
+            let value, _ = rewrite_builder_expr env field.x in
+            {field with x = value})
+          fields
+      in
+      ({expr with pexp_desc = Pexp_record (fields, None)}, false)
+    | _ -> (expr, false)
+
+let rewrite_builder_marker_expr expr =
+  fst (rewrite_builder_expr empty_builder_env expr)
+
+let rec rewrite_builder_module_expr mod_expr =
+  match mod_expr.pmod_desc with
+  | Pmod_structure structure ->
+    {
+      mod_expr with
+      pmod_desc = Pmod_structure (rewrite_builder_structure structure);
+    }
+  | Pmod_functor (param, mty, body) ->
+    {
+      mod_expr with
+      pmod_desc = Pmod_functor (param, mty, rewrite_builder_module_expr body);
+    }
+  | _ -> mod_expr
+
+and rewrite_builder_structure_item item =
+  match item.pstr_desc with
+  | Pstr_value (rec_flag, bindings) ->
+    let _, bindings =
+      rewrite_builder_bindings empty_builder_env rec_flag bindings
+    in
+    {item with pstr_desc = Pstr_value (rec_flag, bindings)}
+  | Pstr_eval (expr, attrs) ->
+    {item with pstr_desc = Pstr_eval (rewrite_builder_marker_expr expr, attrs)}
+  | Pstr_module module_binding ->
+    {
+      item with
+      pstr_desc =
+        Pstr_module
+          {
+            module_binding with
+            pmb_expr = rewrite_builder_module_expr module_binding.pmb_expr;
+          };
+    }
+  | Pstr_recmodule bindings ->
+    {
+      item with
+      pstr_desc =
+        Pstr_recmodule
+          (List.map
+             (fun binding ->
+               {
+                 binding with
+                 pmb_expr = rewrite_builder_module_expr binding.pmb_expr;
+               })
+             bindings);
+    }
+  | Pstr_include include_decl ->
+    {
+      item with
+      pstr_desc =
+        Pstr_include
+          {
+            include_decl with
+            pincl_mod = rewrite_builder_module_expr include_decl.pincl_mod;
+          };
+    }
+  | _ -> item
+
+and rewrite_builder_structure structure =
+  List.map rewrite_builder_structure_item structure
 
 let rewrite (ast : structure) : structure =
   let mapper =
@@ -894,6 +1541,7 @@ let rewrite (ast : structure) : structure =
     }
   in
   let ast = mapper.structure mapper ast in
+  let ast = rewrite_builder_structure ast in
   if needs_comptime_surface ast then comptime_surface_items () @ ast else ast
 
 type generated_kind =
@@ -976,6 +1624,7 @@ let is_hidden_generated_type_expr expr =
     List.mem name
       [
         "__generatedOption";
+        "__generatedOptional";
         "__generatedArray";
         "__generatedList";
         "__generatedTuple";
@@ -1054,6 +1703,7 @@ let infer_type_constructor_kind expr =
              "Bool";
              "Json";
              "Option";
+             "Optional";
              "Array";
              "List";
              "Tuple";
@@ -1176,6 +1826,7 @@ let rec infer_generated_kind env expr =
         when List.mem name
                [
                  "__generatedOption";
+                 "__generatedOptional";
                  "__generatedArray";
                  "__generatedList";
                  "__generatedTuple";
@@ -1299,6 +1950,9 @@ and rewrite_generated_type_expr env expr =
     generated_constant "__generatedJson"
   | Pexp_construct ({txt = Lident "Option"; _}, Some inner) ->
     generated_apply "__generatedOption"
+      [(Nolabel, rewrite_generated_type_expr env inner)]
+  | Pexp_construct ({txt = Lident "Optional"; _}, Some inner) ->
+    generated_apply "__generatedOptional"
       [(Nolabel, rewrite_generated_type_expr env inner)]
   | Pexp_construct ({txt = Lident "Array"; _}, Some inner) ->
     generated_apply "__generatedArray"

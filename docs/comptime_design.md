@@ -98,6 +98,33 @@ let decodeUser: JSON.t => option<user> = %comptime(makeJsonDecoder())
 let copyUser: user => user = %comptime(makeCopy())
 ```
 
+Record values can be staged with ordinary-looking record update syntax when a
+comptime helper needs to return an actual record:
+
+```rescript
+open Comptime
+
+let finish = (_obj, builder) => Some(builder)
+
+let addField = (next, field) =>
+  (obj, r) =>
+    switch Dict.get(obj, field.name) {
+    | Some(valueJson) =>
+      switch decodeByType(field.typ, valueJson) {
+      | Some(value) => next(obj, {...r, field: value})
+      | None => None
+      }
+    | None => None
+    }
+
+let seed = {}
+Array.reduceRight(fields, finish, addField)(obj, seed)
+```
+
+The compiler lowers `{...r, field: value}` to the existing internal builder
+path. The `field` label here refers to the reflected field descriptor variable,
+not a static record label named `"field"`.
+
 ### Type-Level Reflection
 
 ```rescript
@@ -272,6 +299,7 @@ Supported generated forms are:
 - `Bool`
 - `Json`
 - `Option(desc)`
+- `Optional(desc)` for generated record fields
 - `Array(desc)`
 - `List(desc)`
 - `Tuple({items})`
@@ -283,6 +311,11 @@ Generated record fields are ordinary records:
 ```rescript
 {name: "fieldName", typ: String}
 ```
+
+When used in generated record fields:
+
+- `typ: Option(String)` means `fieldName: option<string>`
+- `typ: Optional(String)` means `fieldName?: string`
 
 Generated constructors use the ordinary `Constructor({...})` surface:
 

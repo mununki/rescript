@@ -44,6 +44,7 @@ type generated_type =
   | GType_bool
   | GType_json
   | GType_option of generated_type
+  | GType_optional of generated_type
   | GType_array of generated_type
   | GType_list of generated_type
   | GType_tuple of generated_type list
@@ -365,6 +366,9 @@ let rec core_type_of_generated_type ~loc = function
       []
   | GType_option inner ->
     Typ.constr ~loc (lid "option") [core_type_of_generated_type ~loc inner]
+  | GType_optional _ ->
+    errorf ~loc
+      "Optional generated types can only be used for generated record fields"
   | GType_array inner ->
     Typ.constr ~loc (lid "array") [core_type_of_generated_type ~loc inner]
   | GType_list inner ->
@@ -381,7 +385,8 @@ let type_declaration_of_generated_type ~loc name generated_type =
   in
   match generated_type with
   | GType_string | GType_int | GType_float | GType_bool | GType_json
-  | GType_option _ | GType_array _ | GType_list _ | GType_tuple _ ->
+  | GType_option _ | GType_optional _ | GType_array _ | GType_list _
+  | GType_tuple _ ->
     mk
       ~manifest:(core_type_of_generated_type ~loc generated_type)
       Ptype_abstract
@@ -389,9 +394,15 @@ let type_declaration_of_generated_type ~loc name generated_type =
     let labels =
       List.map
         (fun (field_name, field_type) ->
-          Type.field
-            (Location.mknoloc field_name)
-            (core_type_of_generated_type ~loc field_type))
+          match field_type with
+          | GType_optional inner ->
+            Type.field ~optional:true
+              (Location.mknoloc field_name)
+              (core_type_of_generated_type ~loc inner)
+          | _ ->
+            Type.field
+              (Location.mknoloc field_name)
+              (core_type_of_generated_type ~loc field_type))
         fields
     in
     mk (Ptype_record labels)
@@ -1034,6 +1045,8 @@ and generated_type_of_value ~loc = function
   | VVariant ("Json", None) -> GType_json
   | VVariant ("Option", Some inner) ->
     GType_option (generated_type_of_value ~loc inner)
+  | VVariant ("Optional", Some inner) ->
+    GType_optional (generated_type_of_value ~loc inner)
   | VVariant ("Array", Some inner) ->
     GType_array (generated_type_of_value ~loc inner)
   | VVariant ("List", Some inner) ->
@@ -1815,6 +1828,13 @@ and eval_ident context loc = function
         unary (fun _context loc args ->
             match args with
             | [VBuilder (kind, builder)] -> VBuilder (ref !kind, ref !builder)
+            | [VRecord record] ->
+              VBuilder
+                ( ref Builder_unknown,
+                  ref
+                    (StringMap.bindings record
+                    |> List.map (fun (name, value) ->
+                           (name, runtime_expr_of_value ~loc context value))) )
             | [value] ->
               VCode
                 (Exp.apply runtime_expr
@@ -1862,6 +1882,12 @@ and eval_ident context loc = function
             | [value] ->
               VTypeExpr (GType_option (generated_type_of_value ~loc value))
             | _ -> errorf ~loc "Comptime.Type.option expects one argument")
+      | Ir.BTypeOptional ->
+        unary (fun _context loc args ->
+            match args with
+            | [value] ->
+              VTypeExpr (GType_optional (generated_type_of_value ~loc value))
+            | _ -> errorf ~loc "Comptime.Type.optional expects one argument")
       | Ir.BTypeArray ->
         unary (fun _context loc args ->
             match args with
