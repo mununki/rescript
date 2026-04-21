@@ -224,7 +224,7 @@ The generator returns descriptor syntax such as `Variant`, `Single`, `Record`,
 
 Current restrictions:
 
-- only non-recursive, non-generic top-level type aliases are supported
+- generated aliases must be declared as non-generic top-level `type t = %comptime(...)`
 - one `type` declaration per `type` item
 - implementation files only
 - `.resi` generation is not supported
@@ -275,6 +275,7 @@ Each reflected constructor exposes:
 Current reflected target support:
 
 - named records
+- recursive named records
 - ordinary variants
 - built-in `list`
 - built-in `result`
@@ -285,7 +286,6 @@ Not currently supported:
 - inline-record constructors
 - polymorphic variants
 - open/extensible variants
-- arbitrary recursive user-defined types
 
 ## Generated Type Surface
 
