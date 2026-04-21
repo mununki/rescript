@@ -80,55 +80,50 @@ let rec encodeByType:
       )
     | Tuple({items}) =>
       JSON.Array(items->Array.map(item => encodeByType(item.typ, item.get(value))))
-    | Variant({constructors}) => encodeVariant(constructors, value)
-    }
-
-and encodeVariant:
-  type a. (array<constructor<a>>, a) => JSON.t =
-  (constructors, value) => {
-    let encodeNoPayload = name =>
-      if allConstructorsNoPayload(constructors) {
-        JSON.String(name)
-      } else {
-        JSON.Object(dict{"tag": JSON.String(name)})
-      }
-
-    let finish = _ => JsError.throwWithMessage("variant value did not match any constructor")
-
-    let addConstructor = (next, constructor) =>
-      value =>
-        switch constructor.payload {
-        | NoPayload =>
-          switch constructor.unpack(value) {
-          | Some(_) => encodeNoPayload(constructor.name)
-          | None => next(value)
-          }
-        | Single(inner) =>
-          switch constructor.unpack(value) {
-          | Some(payload) =>
-            JSON.Object(
-              dict{
-                "tag": JSON.String(constructor.name),
-                "value": encodeByType(inner, payload),
-              },
-            )
-          | None => next(value)
-          }
-        | Tuple({items}) =>
-          switch constructor.unpack(value) {
-          | Some(payload) =>
-            JSON.Object(
-              dict{
-                "tag": JSON.String(constructor.name),
-                "value": encodeByType(Tuple({items: items}), payload),
-              },
-            )
-          | None => next(value)
-          }
+    | Variant({constructors}) =>
+      let encodeNoPayload = name =>
+        if allConstructorsNoPayload(constructors) {
+          JSON.String(name)
+        } else {
+          JSON.Object(dict{"tag": JSON.String(name)})
         }
 
-    Array.reduceRight(constructors, finish, addConstructor)(value)
-  }
+      let finish = _ => JsError.throwWithMessage("variant value did not match any constructor")
+
+      let addConstructor = (next, constructor) =>
+        value =>
+          switch constructor.payload {
+          | NoPayload =>
+            switch constructor.unpack(value) {
+            | Some(_) => encodeNoPayload(constructor.name)
+            | None => next(value)
+            }
+          | Single(inner) =>
+            switch constructor.unpack(value) {
+            | Some(payload) =>
+              JSON.Object(
+                dict{
+                  "tag": JSON.String(constructor.name),
+                  "value": encodeByType(inner, payload),
+                },
+              )
+            | None => next(value)
+            }
+          | Tuple({items}) =>
+            switch constructor.unpack(value) {
+            | Some(payload) =>
+              JSON.Object(
+                dict{
+                  "tag": JSON.String(constructor.name),
+                  "value": encodeByType(Tuple({items: items}), payload),
+                },
+              )
+            | None => next(value)
+            }
+          }
+
+      Array.reduceRight(constructors, finish, addConstructor)(value)
+    }
 
 and decodeJsonList:
   type a. (array<JSON.t>, JSON.t => option<a>) => option<list<a>> =
@@ -190,131 +185,111 @@ and decodeByType:
       }
     | Record({fields}) =>
       switch json {
-      | JSON.Object(obj) => decodeRecordFromObject(fields, obj)
+      | JSON.Object(obj) =>
+        let finish = (_obj, builder) => Some(builder)
+
+        let addField = (next, field) =>
+          (obj, builder) =>
+            switch Dict.get(obj, field.name) {
+            | Some(valueJson) =>
+              switch decodeByType(field.typ, valueJson) {
+              | Some(value) =>
+                let nextBuilder = Dict.copy(builder)
+                Dict.set(nextBuilder, field.name, value)
+                next(obj, nextBuilder)
+              | None => None
+              }
+            | None => None
+            }
+
+        Array.reduceRight(fields, finish, addField)(obj, Dict.make())
       | _ => None
       }
     | Tuple({items}) =>
       switch json {
-      | JSON.Array(values) => decodeTupleFromArray(items, values)
+      | JSON.Array(values) =>
+        let finish = (_values, builder) => Some(builder)
+
+        let addItem = (next, item) =>
+          (values, builder) =>
+            switch values[item.index] {
+            | Some(valueJson) =>
+              switch decodeByType(item.typ, valueJson) {
+              | Some(value) =>
+                let nextBuilder = Dict.copy(builder)
+                Dict.set(nextBuilder, item.index, value)
+                next(values, nextBuilder)
+              | None => None
+              }
+            | None => None
+            }
+
+        Array.reduceRight(items, finish, addItem)(values, Dict.make())
       | _ => None
       }
     | Variant({constructors}) =>
       if allConstructorsNoPayload(constructors) {
         switch json {
-        | JSON.String(tag) => decodeEnumVariant(constructors, tag)
+        | JSON.String(tag) =>
+          let finish = _ => None
+
+          let addConstructor = (next, constructor) =>
+            tag =>
+              switch constructor.payload {
+              | NoPayload =>
+                if constructor.name == tag {
+                  Some(constructor.make())
+                } else {
+                  next(tag)
+                }
+              | _ => next(tag)
+              }
+
+          Array.reduceRight(constructors, finish, addConstructor)(tag)
         | _ => None
         }
       } else {
         switch json {
         | JSON.Object(obj) =>
           switch Dict.get(obj, "tag") {
-          | Some(JSON.String(tag)) => decodeTaggedVariant(constructors, tag, obj)
+          | Some(JSON.String(tag)) =>
+            let finish = (_tag, _obj) => None
+
+            let addConstructor = (next, constructor) =>
+              (tag, obj) =>
+                if constructor.name == tag {
+                  switch constructor.payload {
+                  | NoPayload => Some(constructor.make())
+                  | Single(inner) =>
+                    switch Dict.get(obj, "value") {
+                    | Some(valueJson) =>
+                      switch decodeByType(inner, valueJson) {
+                      | Some(value) => Some(constructor.make(value))
+                      | None => None
+                      }
+                    | None => None
+                    }
+                  | Tuple({items}) =>
+                    switch Dict.get(obj, "value") {
+                    | Some(valueJson) =>
+                      switch decodeByType(Tuple({items: items}), valueJson) {
+                      | Some(value) => Some(constructor.make(value))
+                      | None => None
+                      }
+                    | None => None
+                    }
+                  }
+                } else {
+                  next(tag, obj)
+                }
+
+            Array.reduceRight(constructors, finish, addConstructor)(tag, obj)
           | _ => None
           }
         | _ => None
         }
       }
     }
-
-and decodeRecordFromObject:
-  type a. (array<field<a>>, dict<JSON.t>) => option<a> =
-  (fields, obj) => {
-    let finish = (_obj, builder) => Some(builder)
-
-    let addField = (next, field) =>
-      (obj, builder) =>
-        switch Dict.get(obj, field.name) {
-        | Some(valueJson) =>
-          switch decodeByType(field.typ, valueJson) {
-          | Some(value) =>
-            let nextBuilder = Dict.copy(builder)
-            Dict.set(nextBuilder, field.name, value)
-            next(obj, nextBuilder)
-          | None => None
-          }
-        | None => None
-        }
-
-    Array.reduceRight(fields, finish, addField)(obj, Dict.make())
-  }
-
-and decodeTupleFromArray:
-  type a. (array<item<a>>, array<JSON.t>) => option<a> =
-  (items, values) => {
-    let finish = (_values, builder) => Some(builder)
-
-    let addItem = (next, item) =>
-      (values, builder) =>
-        switch values[item.index] {
-        | Some(valueJson) =>
-          switch decodeByType(item.typ, valueJson) {
-          | Some(value) =>
-            let nextBuilder = Dict.copy(builder)
-            Dict.set(nextBuilder, item.index, value)
-            next(values, nextBuilder)
-          | None => None
-          }
-        | None => None
-        }
-
-    Array.reduceRight(items, finish, addItem)(values, Dict.make())
-  }
-
-and decodeEnumVariant:
-  type a. (array<constructor<a>>, string) => option<a> =
-  (constructors, tag) => {
-    let finish = _ => None
-
-    let addConstructor = (next, constructor) =>
-      tag =>
-        switch constructor.payload {
-        | NoPayload =>
-          if constructor.name == tag {
-            Some(constructor.make())
-          } else {
-            next(tag)
-          }
-        | _ => next(tag)
-        }
-
-    Array.reduceRight(constructors, finish, addConstructor)(tag)
-  }
-
-and decodeTaggedVariant:
-  type a. (array<constructor<a>>, string, dict<JSON.t>) => option<a> =
-  (constructors, tag, obj) => {
-    let finish = (_tag, _obj) => None
-
-    let addConstructor = (next, constructor) =>
-      (tag, obj) =>
-        if constructor.name == tag {
-          switch constructor.payload {
-          | NoPayload => Some(constructor.make())
-          | Single(inner) =>
-            switch Dict.get(obj, "value") {
-            | Some(valueJson) =>
-              switch decodeByType(inner, valueJson) {
-              | Some(value) => Some(constructor.make(value))
-              | None => None
-              }
-            | None => None
-            }
-          | Tuple({items}) =>
-            switch Dict.get(obj, "value") {
-            | Some(valueJson) =>
-              switch decodeByType(Tuple({items: items}), valueJson) {
-              | Some(value) => Some(constructor.make(value))
-              | None => None
-              }
-            | None => None
-            }
-          }
-        } else {
-          next(tag, obj)
-        }
-
-    Array.reduceRight(constructors, finish, addConstructor)(tag, obj)
-  }
 
 and copyByType:
   type a. (typeDesc<a>, a) => a =
@@ -344,36 +319,31 @@ and copyByType:
         Dict.set(nextBuilder, item.index, copyByType(item.typ, item.get(value)))
         nextBuilder
       })
-    | Variant({constructors}) => copyVariant(constructors, value)
+    | Variant({constructors}) =>
+      let finish = _ => JsError.throwWithMessage("variant value did not match any constructor")
+
+      let addConstructor = (next, constructor) =>
+        value =>
+          switch constructor.payload {
+          | NoPayload =>
+            switch constructor.unpack(value) {
+            | Some(_) => constructor.make()
+            | None => next(value)
+            }
+          | Single(inner) =>
+            switch constructor.unpack(value) {
+            | Some(payload) => constructor.make(copyByType(inner, payload))
+            | None => next(value)
+            }
+          | Tuple({items}) =>
+            switch constructor.unpack(value) {
+            | Some(payload) => constructor.make(copyByType(Tuple({items: items}), payload))
+            | None => next(value)
+            }
+          }
+
+      Array.reduceRight(constructors, finish, addConstructor)(value)
     }
-
-and copyVariant:
-  type a. (array<constructor<a>>, a) => a =
-  (constructors, value) => {
-    let finish = _ => JsError.throwWithMessage("variant value did not match any constructor")
-
-    let addConstructor = (next, constructor) =>
-      value =>
-        switch constructor.payload {
-        | NoPayload =>
-          switch constructor.unpack(value) {
-          | Some(_) => constructor.make()
-          | None => next(value)
-          }
-        | Single(inner) =>
-          switch constructor.unpack(value) {
-          | Some(payload) => constructor.make(copyByType(inner, payload))
-          | None => next(value)
-          }
-        | Tuple({items}) =>
-          switch constructor.unpack(value) {
-          | Some(payload) => constructor.make(copyByType(Tuple({items: items}), payload))
-          | None => next(value)
-          }
-        }
-
-    Array.reduceRight(constructors, finish, addConstructor)(value)
-  }
 
 let makeJsonEncoder:
   type t. unit => t => JSON.t =

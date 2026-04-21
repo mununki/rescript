@@ -141,6 +141,12 @@ let classify_payload_scrutinee expr =
     Some ctor_name
   | _ -> None
 
+let classify_constructor_scrutinee expr =
+  match expr.pexp_desc with
+  | Pexp_ident {txt = Lident ctor_name; _} when ctor_name = "constructor" ->
+    Some ctor_name
+  | _ -> None
+
 let name_get_payload_pattern extra_fields =
   Pat.record
     ([
@@ -408,6 +414,20 @@ let lower_member_typ_pattern subject pat =
 let lower_constructor_payload_pattern pat =
   match pat.ppat_desc with
   | Ppat_construct ({txt = Lident "NoPayload"; _}, None) ->
+    Pat.construct (lid "NoPayload") None
+  | Ppat_construct ({txt = Lident "Single"; _}, Some inner) ->
+    Pat.construct (lid "SinglePayload") (Some (lower_type_desc_pattern inner))
+  | Ppat_construct ({txt = Lident "Tuple"; _}, Some payload) ->
+    Pat.construct (lid "TuplePayload")
+      (Some (lower_type_desc_payload_pattern TuplePayload payload))
+  | Ppat_any -> Pat.any ()
+  | _ ->
+    errorf ~loc:pat.ppat_loc
+      "Unsupported `constructor.payload` pattern in comptime surface"
+
+let lower_constructor_pattern pat =
+  match pat.ppat_desc with
+  | Ppat_construct ({txt = Lident "NoPayload"; _}, None) ->
     Pat.construct
       (lid "NoPayloadConstructor")
       (Some (constructor_payload_pattern []))
@@ -436,9 +456,10 @@ let lower_constructor_payload_pattern pat =
   | Ppat_any -> Pat.any ()
   | _ ->
     errorf ~loc:pat.ppat_loc
-      "Unsupported `constructor.payload` pattern in comptime surface"
+      "Unsupported `constructor` pattern in comptime surface"
 
 let rewrite_subject_case_rhs ~subject_kind ~subject_name expr =
+  let subject_expr = Exp.ident (lid subject_name) in
   let mapper =
     {
       default_mapper with
@@ -448,8 +469,11 @@ let rewrite_subject_case_rhs ~subject_kind ~subject_name expr =
           | Pexp_field
               ( {pexp_desc = Pexp_ident {txt = Lident name; _}; _},
                 {txt = Lident "name"; _} )
-            when name = subject_name && subject_kind <> `Item ->
-            Exp.ident (lid "name")
+            when name = subject_name && subject_kind <> `Item -> (
+            match subject_kind with
+            | `Field | `Constructor -> Exp.ident (lid "name")
+            | `Constructor_payload -> constructor_name_expr subject_expr
+            | `Item -> assert false)
           | Pexp_field
               ( {pexp_desc = Pexp_ident {txt = Lident name; _}; _},
                 {txt = Lident "index"; _} )
@@ -492,6 +516,21 @@ let rewrite_subject_case_rhs ~subject_kind ~subject_name expr =
                     pexp_desc =
                       Pexp_field
                         ( {pexp_desc = Pexp_ident {txt = Lident name; _}; _},
+                          {txt = Lident "unpack"; _} );
+                    _;
+                  };
+                args = [(Nolabel, arg)];
+                _;
+              }
+            when name = subject_name && subject_kind = `Constructor_payload ->
+            constructor_unpack_expr subject_expr (self.expr self arg)
+          | Pexp_apply
+              {
+                funct =
+                  {
+                    pexp_desc =
+                      Pexp_field
+                        ( {pexp_desc = Pexp_ident {txt = Lident name; _}; _},
                           {txt = Lident "make"; _} );
                     _;
                   };
@@ -500,6 +539,21 @@ let rewrite_subject_case_rhs ~subject_kind ~subject_name expr =
               }
             when name = subject_name && subject_kind = `Constructor ->
             Exp.apply (Exp.ident (lid "make")) [(Nolabel, self.expr self arg)]
+          | Pexp_apply
+              {
+                funct =
+                  {
+                    pexp_desc =
+                      Pexp_field
+                        ( {pexp_desc = Pexp_ident {txt = Lident name; _}; _},
+                          {txt = Lident "make"; _} );
+                    _;
+                  };
+                args = [(Nolabel, arg)];
+                _;
+              }
+            when name = subject_name && subject_kind = `Constructor_payload ->
+            constructor_make_expr subject_expr (self.expr self arg)
           | Pexp_construct ({txt = Lident "Some"; _}, Some payload) ->
             Exp.construct (lid "Some")
               (Some (erase_expr (self.expr self payload)))
@@ -632,6 +686,11 @@ module Comptime = {
         constructorItems: array<item<'a>>,
       }): constructor<'v>
 
+  and constructorPayload<'a> =
+    | NoPayload: constructorPayload<unit>
+    | SinglePayload(typeDesc<'a>): constructorPayload<'a>
+    | TuplePayload(tupleDesc<'a>): constructorPayload<'a>
+
   and recordDesc<'a> = {recordName: string, fields: array<field<'a>>}
 
   and tupleDesc<'a> = {
@@ -655,6 +714,10 @@ module Comptime = {
     | Record(recordDesc<'a>): typeDesc<'a>
     | Tuple(tupleDesc<'a>): typeDesc<'a>
     | Variant(variantDesc<'a>): typeDesc<'a>
+
+  type recordField<'a> = field<'a>
+  type tupleItem<'a> = item<'a>
+  type variantConstructor<'a> = constructor<'a>
 
   external reflect: unit => typeDesc<'a> = "%identity"
   external __marker: 'a => 'a = "%identity"
@@ -682,7 +745,7 @@ module Comptime = {
   external __itemType: item<'r> => typeDesc<'a> = "comptime_item_type"
   external __itemIndex: item<'r> => int = "comptime_item_index"
   external __itemGet: (item<'r>, 'r) => 'a = "comptime_item_get"
-  external __constructorPayload: constructor<'v> => 'a = "comptime_constructor_payload"
+  external __constructorPayload: constructor<'v> => constructorPayload<'a> = "comptime_constructor_payload"
   external __constructorName: constructor<'v> => string = "comptime_constructor_name"
   external __constructorUnpack: (constructor<'v>, 'v) => option<'a> = "comptime_constructor_unpack"
   external __constructorMake: (constructor<'v>, 'a) => 'v = "comptime_constructor_make"
@@ -1409,7 +1472,9 @@ let rewrite (ast : structure) : structure =
             | None -> (
               match classify_payload_scrutinee scrutinee with
               | Some subject_name ->
-                let scrutinee = Exp.ident (lid subject_name) in
+                let scrutinee =
+                  constructor_payload_expr (Exp.ident (lid subject_name))
+                in
                 let cases =
                   List.map
                     (fun case ->
@@ -1417,13 +1482,31 @@ let rewrite (ast : structure) : structure =
                         case with
                         pc_lhs = lower_constructor_payload_pattern case.pc_lhs;
                         pc_rhs =
-                          rewrite_subject_case_rhs ~subject_kind:`Constructor
-                            ~subject_name case.pc_rhs;
+                          rewrite_subject_case_rhs
+                            ~subject_kind:`Constructor_payload ~subject_name
+                            case.pc_rhs;
                       })
                     cases
                 in
                 {expr with pexp_desc = Pexp_match (scrutinee, cases)}
-              | None -> default_mapper.expr self expr))
+              | None -> (
+                match classify_constructor_scrutinee scrutinee with
+                | Some subject_name ->
+                  let scrutinee = Exp.ident (lid subject_name) in
+                  let cases =
+                    List.map
+                      (fun case ->
+                        {
+                          case with
+                          pc_lhs = lower_constructor_pattern case.pc_lhs;
+                          pc_rhs =
+                            rewrite_subject_case_rhs ~subject_kind:`Constructor
+                              ~subject_name case.pc_rhs;
+                        })
+                      cases
+                  in
+                  {expr with pexp_desc = Pexp_match (scrutinee, cases)}
+                | None -> default_mapper.expr self expr)))
           | Pexp_field
               ( ({pexp_desc = Pexp_ident {txt = Lident "field"; _}; _} as
                  field_expr),
@@ -2193,7 +2276,10 @@ let rewrite_expr_in_surface expr =
           _;
         }
         when txt = marker ->
-        Some (rewrite_generated_type_expr GeneratedEnv.empty pvb_expr)
+        let rewritten =
+          rewrite_generated_type_expr GeneratedEnv.empty pvb_expr
+        in
+        Some rewritten
       | _ -> None)
     ast
   |> Option.get

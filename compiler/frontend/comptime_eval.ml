@@ -8,7 +8,12 @@ module Ir = Comptime_ir
 module StringMap = Map.Make (String)
 module IdentSet = Set.Make (Ident)
 
-type resolved_type =
+type resolved_type = {
+  type_id: int;
+  mutable type_desc: resolved_type_desc option;
+}
+
+and resolved_type_desc =
   | Type_string
   | Type_int
   | Type_float
@@ -72,6 +77,10 @@ and value =
   | VFloat of float
   | VString of string
   | VBool of bool
+  | VTypeDesc of resolved_type
+  | VFieldDesc of resolved_field
+  | VItemDesc of resolved_item
+  | VConstructorDesc of resolved_constructor
   | VWitness of Types.type_expr
   | VArray of value list
   | VTuple of value list
@@ -87,7 +96,12 @@ and value =
   | VDecl of generated_decl
   | VCode of expression
 
-and closure = {pattern: Ir.pattern; body: Ir.expr; env: value Ident.tbl ref}
+and closure = {
+  pattern: Ir.pattern;
+  body: Ir.expr;
+  env: value Ident.tbl ref;
+  closure_name: string option;
+}
 
 and builtin = {arity: int; apply: context -> Location.t -> value list -> value}
 
@@ -95,6 +109,8 @@ and top_source = {
   source_name: string;
   source_expr: Typedtree.expression;
   source_loc: Location.t;
+  source_rec_flag: rec_flag;
+  source_group: Typedtree.value_binding list;
 }
 
 and context = {
@@ -105,6 +121,7 @@ and context = {
   target_type: Types.type_expr option;
   active_types: Types.type_expr list;
   type_env: Env.t;
+  recursive_runtime_apps: (string * int, string) Hashtbl.t;
 }
 
 let gensym_counter = ref 0
@@ -117,6 +134,57 @@ let stage_expression context env expr = !stage_expression_ref context env expr
 
 let errorf ~loc fmt =
   Format.kasprintf (fun message -> Location.raise_errorf ~loc "%s" message) fmt
+
+let resolved_type_id = ref 0
+
+let make_resolved_type desc =
+  incr resolved_type_id;
+  {type_id = !resolved_type_id; type_desc = Some desc}
+
+let make_pending_resolved_type () =
+  incr resolved_type_id;
+  {type_id = !resolved_type_id; type_desc = None}
+
+let fresh_comptime_name base =
+  incr gensym_counter;
+  base ^ "$comptime" ^ string_of_int !gensym_counter
+
+let resolved_type_desc ~loc ty =
+  match ty.type_desc with
+  | Some desc -> desc
+  | None -> errorf ~loc "Internal error: unresolved recursive comptime type"
+
+let resolved_type_is_recursive ty =
+  let visiting = Hashtbl.create 16 in
+  let visited = Hashtbl.create 16 in
+  let rec loop ty =
+    if Hashtbl.mem visited ty.type_id then false
+    else if Hashtbl.mem visiting ty.type_id then true
+    else (
+      Hashtbl.replace visiting ty.type_id ();
+      let recursive =
+        match resolved_type_desc ~loc:Location.none ty with
+        | Type_string | Type_int | Type_float | Type_bool | Type_json -> false
+        | Type_option inner | Type_array inner | Type_list inner -> loop inner
+        | Type_record (_, fields) ->
+          List.exists (fun field -> loop field.field_type) fields
+        | Type_tuple items ->
+          List.exists (fun item -> loop item.item_type) items
+        | Type_variant (_, constructors) ->
+          List.exists
+            (fun constructor ->
+              match constructor.constructor_payload with
+              | Payload_none -> false
+              | Payload_single inner -> loop inner
+              | Payload_tuple items ->
+                List.exists (fun item -> loop item.item_type) items)
+            constructors
+      in
+      Hashtbl.remove visiting ty.type_id;
+      Hashtbl.replace visited ty.type_id ();
+      recursive)
+  in
+  loop ty
 
 let current_reflected_type context =
   match context.active_types with
@@ -147,6 +215,10 @@ let rec value_kind = function
   | VFloat _ -> "float"
   | VString _ -> "string"
   | VBool _ -> "bool"
+  | VTypeDesc _ -> "type-desc"
+  | VFieldDesc _ -> "field-desc"
+  | VItemDesc _ -> "item-desc"
+  | VConstructorDesc _ -> "constructor-desc"
   | VWitness _ -> "witness"
   | VArray _ -> "array"
   | VTuple _ -> "tuple"
@@ -206,113 +278,124 @@ let is_json_path path =
   || String.ends_with ~suffix:"Stdlib_JSON.t" name
 
 let resolve_type env ty =
-  let rec loop visited ty =
+  let cache = Hashtbl.create 16 in
+  let rec loop ty =
     let ty = Ctype.repr ty in
     match ty.desc with
     | Types.Ttuple tys ->
-      Type_tuple
-        (List.mapi
-           (fun item_index item_type ->
-             {
-               item_index;
-               item_arity = List.length tys;
-               item_type = loop visited item_type;
-             })
-           tys)
+      make_resolved_type
+        (Type_tuple
+           (List.mapi
+              (fun item_index item_type ->
+                {
+                  item_index;
+                  item_arity = List.length tys;
+                  item_type = loop item_type;
+                })
+              tys))
     | Types.Tconstr (path, [inner], _) when Path.name path = "option" ->
-      Type_option (loop visited inner)
+      make_resolved_type (Type_option (loop inner))
     | Types.Tconstr (path, [inner], _) when Path.name path = "array" ->
-      Type_array (loop visited inner)
+      make_resolved_type (Type_array (loop inner))
     | Types.Tconstr (path, [inner], _) when Path.name path = "list" ->
-      Type_list (loop visited inner)
+      make_resolved_type (Type_list (loop inner))
     | Types.Tconstr (path, [ok_ty; err_ty], _) when Path.name path = "result" ->
-      Type_variant
-        ( "result",
-          [
-            {
-              constructor_name = "Ok";
-              constructor_payload = Payload_single (loop visited ok_ty);
-            };
-            {
-              constructor_name = "Error";
-              constructor_payload = Payload_single (loop visited err_ty);
-            };
-          ] )
+      make_resolved_type
+        (Type_variant
+           ( "result",
+             [
+               {
+                 constructor_name = "Ok";
+                 constructor_payload = Payload_single (loop ok_ty);
+               };
+               {
+                 constructor_name = "Error";
+                 constructor_payload = Payload_single (loop err_ty);
+               };
+             ] ))
     | Types.Tconstr (path, [], _) -> (
       match Path.name path with
-      | "string" -> Type_string
-      | "int" -> Type_int
-      | "float" -> Type_float
-      | "bool" -> Type_bool
-      | _ when is_json_path path -> Type_json
+      | "string" -> make_resolved_type Type_string
+      | "int" -> make_resolved_type Type_int
+      | "float" -> make_resolved_type Type_float
+      | "bool" -> make_resolved_type Type_bool
+      | _ when is_json_path path -> make_resolved_type Type_json
       | type_name -> (
-        if List.mem type_name visited then
-          errorf ~loc:Location.none
-            "Recursive types are not supported in comptime reflection";
-        let decl = Env.find_type path env in
-        if decl.type_params <> [] then
-          errorf ~loc:Location.none
-            "Generic types are not supported in comptime reflection";
-        match decl.type_kind with
-        | Types.Type_record (labels, _) ->
-          Type_record
-            ( Path.last path,
-              List.map
-                (fun label ->
-                  {
-                    field_name = Ident.name label.Types.ld_id;
-                    field_type = loop (type_name :: visited) label.Types.ld_type;
-                  })
-                labels )
-        | Types.Type_variant constructors ->
-          Type_variant
-            ( Path.last path,
-              List.map
-                (fun constructor ->
-                  let constructor_payload =
-                    match constructor.Types.cd_args with
-                    | Types.Cstr_tuple [] -> Payload_none
-                    | Types.Cstr_tuple [inner] ->
-                      Payload_single (loop (type_name :: visited) inner)
-                    | Types.Cstr_tuple inners ->
-                      Payload_tuple
-                        (List.mapi
-                           (fun item_index item_type ->
-                             {
-                               item_index;
-                               item_arity = List.length inners;
-                               item_type = loop (type_name :: visited) item_type;
-                             })
-                           inners)
-                    | Types.Cstr_record _ ->
-                      errorf ~loc:constructor.Types.cd_loc
-                        "Inline-record variant constructors are not supported \
-                         in comptime reflection"
-                  in
-                  if constructor.Types.cd_res <> None then
-                    errorf ~loc:constructor.Types.cd_loc
-                      "GADT constructors are not supported in comptime \
-                       reflection";
-                  {
-                    constructor_name = Ident.name constructor.Types.cd_id;
-                    constructor_payload;
-                  })
-                constructors )
-        | Types.Type_abstract -> (
-          match decl.type_manifest with
-          | Some manifest -> loop (type_name :: visited) manifest
-          | None ->
+        match Hashtbl.find_opt cache type_name with
+        | Some resolved -> resolved
+        | None ->
+          let resolved = make_pending_resolved_type () in
+          Hashtbl.add cache type_name resolved;
+          let decl = Env.find_type path env in
+          if decl.type_params <> [] then
             errorf ~loc:Location.none
-              "Abstract types are not supported in comptime reflection")
-        | Types.Type_open ->
-          errorf ~loc:Location.none
-            "Open types are not supported in comptime reflection"))
+              "Generic types are not supported in comptime reflection";
+          let desc =
+            match decl.type_kind with
+            | Types.Type_record (labels, _) ->
+              Type_record
+                ( Path.last path,
+                  List.map
+                    (fun label ->
+                      {
+                        field_name = Ident.name label.Types.ld_id;
+                        field_type = loop label.Types.ld_type;
+                      })
+                    labels )
+            | Types.Type_variant constructors ->
+              Type_variant
+                ( Path.last path,
+                  List.map
+                    (fun constructor ->
+                      let constructor_payload =
+                        match constructor.Types.cd_args with
+                        | Types.Cstr_tuple [] -> Payload_none
+                        | Types.Cstr_tuple [inner] ->
+                          Payload_single (loop inner)
+                        | Types.Cstr_tuple inners ->
+                          Payload_tuple
+                            (List.mapi
+                               (fun item_index item_type ->
+                                 {
+                                   item_index;
+                                   item_arity = List.length inners;
+                                   item_type = loop item_type;
+                                 })
+                               inners)
+                        | Types.Cstr_record _ ->
+                          errorf ~loc:constructor.Types.cd_loc
+                            "Inline-record variant constructors are not \
+                             supported in comptime reflection"
+                      in
+                      if constructor.Types.cd_res <> None then
+                        errorf ~loc:constructor.Types.cd_loc
+                          "GADT constructors are not supported in comptime \
+                           reflection";
+                      {
+                        constructor_name = Ident.name constructor.Types.cd_id;
+                        constructor_payload;
+                      })
+                    constructors )
+            | Types.Type_abstract -> (
+              match decl.type_manifest with
+              | Some manifest ->
+                resolved_type_desc ~loc:Location.none (loop manifest)
+              | None ->
+                errorf ~loc:Location.none
+                  "Abstract types are not supported in comptime reflection")
+            | Types.Type_open ->
+              errorf ~loc:Location.none
+                "Open types are not supported in comptime reflection"
+          in
+          resolved.type_desc <- Some desc;
+          resolved))
     | _ ->
       errorf ~loc:Location.none "Unsupported type shape in comptime reflection"
   in
-  loop [] ty
+  loop ty
 
-let rec generated_type_of_resolved_type = function
+let rec generated_type_of_resolved_type ty =
+  match resolved_type_desc ~loc:Location.none ty with
   | Type_string -> GType_string
   | Type_int -> GType_int
   | Type_float -> GType_float
@@ -555,6 +638,7 @@ let constructor_make_builtin constructor_name payload =
                 constructor_name
           in
           let rec payload_expr resolved value =
+            let resolved = Option.map (resolved_type_desc ~loc) resolved in
             match (resolved, value) with
             | _, VCode expr -> expr
             | _, VUnit -> Exp.construct (lid "()") None
@@ -632,7 +716,8 @@ let constructor_make_builtin constructor_name payload =
             match payload with
             | Payload_none -> None
             | Payload_single inner -> Some inner
-            | Payload_tuple items -> Some (Type_tuple items)
+            | Payload_tuple items ->
+              Some (make_resolved_type (Type_tuple items))
           in
           let tuple_payload_exprs items value =
             match value with
@@ -715,9 +800,9 @@ let rec field_record_payload field_name field_type =
     StringMap.empty
     |> StringMap.add "fieldName" (VString field_name)
     |> StringMap.add "fieldGet" (field_get_builtin field_name)
-    |> StringMap.add "__type" (type_desc_value_of_resolved_type field_type)
+    |> StringMap.add "__type" (VTypeDesc field_type)
   in
-  match field_type with
+  match resolved_type_desc ~loc:Location.none field_type with
   | Type_string -> VVariant ("StringField", Some (VRecord payload))
   | Type_int -> VVariant ("IntField", Some (VRecord payload))
   | Type_float -> VVariant ("FloatField", Some (VRecord payload))
@@ -726,27 +811,15 @@ let rec field_record_payload field_name field_type =
   | Type_option inner ->
     VVariant
       ( "OptionField",
-        Some
-          (VRecord
-             (StringMap.add "fieldInner"
-                (type_desc_value_of_resolved_type inner)
-                payload)) )
+        Some (VRecord (StringMap.add "fieldInner" (VTypeDesc inner) payload)) )
   | Type_array inner ->
     VVariant
       ( "ArrayField",
-        Some
-          (VRecord
-             (StringMap.add "fieldInner"
-                (type_desc_value_of_resolved_type inner)
-                payload)) )
+        Some (VRecord (StringMap.add "fieldInner" (VTypeDesc inner) payload)) )
   | Type_list inner ->
     VVariant
       ( "ListField",
-        Some
-          (VRecord
-             (StringMap.add "fieldInner"
-                (type_desc_value_of_resolved_type inner)
-                payload)) )
+        Some (VRecord (StringMap.add "fieldInner" (VTypeDesc inner) payload)) )
   | Type_record (_name, fields) ->
     VVariant
       ( "RecordField",
@@ -780,9 +853,9 @@ and item_value_of_resolved_item item =
     |> StringMap.add "itemIndex" (VInt item.item_index)
     |> StringMap.add "itemGet"
          (tuple_item_get_builtin item.item_index item.item_arity)
-    |> StringMap.add "__type" (type_desc_value_of_resolved_type item.item_type)
+    |> StringMap.add "__type" (VTypeDesc item.item_type)
   in
-  match item.item_type with
+  match resolved_type_desc ~loc:Location.none item.item_type with
   | Type_string -> VVariant ("StringItem", Some (VRecord payload))
   | Type_int -> VVariant ("IntItem", Some (VRecord payload))
   | Type_float -> VVariant ("FloatItem", Some (VRecord payload))
@@ -791,27 +864,15 @@ and item_value_of_resolved_item item =
   | Type_option inner ->
     VVariant
       ( "OptionItem",
-        Some
-          (VRecord
-             (StringMap.add "itemInner"
-                (type_desc_value_of_resolved_type inner)
-                payload)) )
+        Some (VRecord (StringMap.add "itemInner" (VTypeDesc inner) payload)) )
   | Type_array inner ->
     VVariant
       ( "ArrayItem",
-        Some
-          (VRecord
-             (StringMap.add "itemInner"
-                (type_desc_value_of_resolved_type inner)
-                payload)) )
+        Some (VRecord (StringMap.add "itemInner" (VTypeDesc inner) payload)) )
   | Type_list inner ->
     VVariant
       ( "ListItem",
-        Some
-          (VRecord
-             (StringMap.add "itemInner"
-                (type_desc_value_of_resolved_type inner)
-                payload)) )
+        Some (VRecord (StringMap.add "itemInner" (VTypeDesc inner) payload)) )
   | Type_record (_name, fields) ->
     VVariant
       ( "RecordItem",
@@ -847,10 +908,10 @@ and constructor_value_of_resolved_constructor constructor =
          (match constructor.constructor_payload with
          | Payload_none -> VVariant ("NoPayload", None)
          | Payload_single inner ->
-           VVariant ("Single", Some (type_desc_value_of_resolved_type inner))
+           VVariant ("SinglePayload", Some (VTypeDesc inner))
          | Payload_tuple items ->
            VVariant
-             ( "Tuple",
+             ( "TuplePayload",
                Some
                  (VRecord
                     (StringMap.empty
@@ -870,10 +931,8 @@ and constructor_value_of_resolved_constructor constructor =
     VVariant
       ( "SingleConstructor",
         Some
-          (VRecord
-             (StringMap.add "constructorInner"
-                (type_desc_value_of_resolved_type inner)
-                payload)) )
+          (VRecord (StringMap.add "constructorInner" (VTypeDesc inner) payload))
+      )
   | Payload_tuple items ->
     VVariant
       ( "TupleConstructor",
@@ -886,27 +945,27 @@ and constructor_value_of_resolved_constructor constructor =
 and field_value_of_resolved_field field =
   field_record_payload field.field_name field.field_type
 
-and type_desc_value_of_resolved_type = function
+and type_desc_value_of_resolved_type ty = VTypeDesc ty
+
+let surface_value_of_type_desc ~loc ty =
+  match resolved_type_desc ~loc ty with
   | Type_string -> VVariant ("String", None)
   | Type_int -> VVariant ("Int", None)
   | Type_float -> VVariant ("Float", None)
   | Type_bool -> VVariant ("Bool", None)
   | Type_json -> VVariant ("Json", None)
-  | Type_option inner ->
-    VVariant ("Option", Some (type_desc_value_of_resolved_type inner))
-  | Type_array inner ->
-    VVariant ("Array", Some (type_desc_value_of_resolved_type inner))
-  | Type_list inner ->
-    VVariant ("List", Some (type_desc_value_of_resolved_type inner))
+  | Type_option inner -> VVariant ("Option", Some (VTypeDesc inner))
+  | Type_array inner -> VVariant ("Array", Some (VTypeDesc inner))
+  | Type_list inner -> VVariant ("List", Some (VTypeDesc inner))
   | Type_record (name, fields) ->
-    let fields_value = VArray (List.map field_value_of_resolved_field fields) in
     VVariant
       ( "Record",
         Some
           (VRecord
              (StringMap.empty
              |> StringMap.add "recordName" (VString name)
-             |> StringMap.add "fields" fields_value)) )
+             |> StringMap.add "fields"
+                  (VArray (List.map field_value_of_resolved_field fields)))) )
   | Type_tuple items ->
     VVariant
       ( "Tuple",
@@ -951,6 +1010,7 @@ let builder_entries_set builder field_name value_expr =
 
 let builder_kind_of_key = function
   | VInt _ -> Some Builder_tuple
+  | VItemDesc _ -> Some Builder_tuple
   | VRecord field -> (
     match StringMap.find_opt "itemIndex" field with
     | Some (VInt _) -> Some Builder_tuple
@@ -981,27 +1041,23 @@ let reflected_member_key field =
         | Some (VString name) -> Some name
         | _ -> None)))
 
+let reflected_member_key_of_value = function
+  | VFieldDesc field -> Some field.field_name
+  | VItemDesc item -> Some (string_of_int item.item_index)
+  | VRecord field -> reflected_member_key field
+  | VVariant (_, Some (VRecord field)) -> reflected_member_key field
+  | _ -> None
+
 let resolve_builder_key ~loc = function
   | VString field_name -> field_name
   | VInt index -> string_of_int index
-  | VRecord field -> (
-    match reflected_member_key field with
+  | value -> (
+    match reflected_member_key_of_value value with
     | Some key -> key
     | None ->
       errorf ~loc
         "Dict.set on a comptime builder expects a compile-time string, int, or \
          reflected member descriptor")
-  | VVariant (_, Some (VRecord field)) -> (
-    match reflected_member_key field with
-    | Some key -> key
-    | None ->
-      errorf ~loc
-        "Dict.set on a comptime builder expects a compile-time string, int, or \
-         reflected member descriptor")
-  | _ ->
-    errorf ~loc
-      "Dict.set on a comptime builder expects a compile-time string, int, or \
-       reflected member descriptor"
 
 let resolve_builder_expected_type context expected =
   try Some (resolve_type context.type_env expected) with
@@ -1038,6 +1094,7 @@ and generated_field_of_value ~loc = function
 
 and generated_type_of_value ~loc = function
   | VTypeExpr generated -> generated
+  | VTypeDesc ty -> generated_type_of_resolved_type ty
   | VVariant ("String", None) -> GType_string
   | VVariant ("Int", None) -> GType_int
   | VVariant ("Float", None) -> GType_float
@@ -1157,7 +1214,10 @@ let rec expr_of_value ~loc ?expected_type context = function
     in
     match expected_type with
     | Some expected -> (
-      match resolve_builder_expected_type context expected with
+      match
+        Option.map (resolved_type_desc ~loc)
+          (resolve_builder_expected_type context expected)
+      with
       | Some (Type_record (_name, fields)) ->
         let find_entry field_name =
           List.find_opt (fun (name, _) -> name = field_name) entries
@@ -1267,7 +1327,7 @@ and runtime_pattern_bindings pattern =
         patterns (Ident.empty, [])
     in
     (env, Pat.tuple patterns)
-  | Ir.PConstruct (name, patterns) ->
+  | Ir.PConstruct (lid, _name, patterns) ->
     let env, patterns =
       List.fold_right
         (fun pattern (env, patterns) ->
@@ -1284,7 +1344,7 @@ and runtime_pattern_bindings pattern =
       | [pattern] -> Some pattern
       | patterns -> Some (Pat.tuple patterns)
     in
-    (env, Pat.construct (lid name) payload)
+    (env, Pat.construct lid payload)
   | Ir.PRecord fields ->
     let env, fields =
       List.fold_right
@@ -1363,7 +1423,9 @@ let rec match_pattern ~loc pattern value =
     if text = value then Some Ident.empty else None
   | Ir.PConstant (Pconst_float (text, _)), VFloat value ->
     if float_of_string text = value then Some Ident.empty else None
-  | Ir.PConstruct ("()", []), VUnit -> Some Ident.empty
+  | pattern, VTypeDesc ty ->
+    match_pattern ~loc pattern (surface_value_of_type_desc ~loc ty)
+  | Ir.PConstruct (_lid, "()", []), VUnit -> Some Ident.empty
   | Ir.PTuple patterns, VTuple values
     when List.length patterns = List.length values ->
     List.fold_left2
@@ -1390,8 +1452,8 @@ let rec match_pattern ~loc pattern value =
           | None -> None)
         | _ -> None)
       (Some Ident.empty) fields
-  | Ir.PConstruct (name, patterns), VVariant (ctor, payload) when name = ctor
-    -> (
+  | Ir.PConstruct (_lid, name, patterns), VVariant (ctor, payload)
+    when name = ctor -> (
     match (patterns, payload) with
     | [], None -> Some Ident.empty
     | [pattern], Some value -> match_pattern ~loc pattern value
@@ -1419,7 +1481,14 @@ let build_recursive_env _context env bindings =
         | Ir.PVar (id, _) ->
           let value =
             match binding.Ir.expr.desc with
-            | Ir.EFun (pattern, body) -> VClosure {pattern; body; env = env_ref}
+            | Ir.EFun (pattern, body) ->
+              VClosure
+                {
+                  pattern;
+                  body;
+                  env = env_ref;
+                  closure_name = Some (Ident.name id);
+                }
             | _ ->
               errorf ~loc:binding.Ir.loc
                 "Recursive comptime bindings must be functions"
@@ -1432,6 +1501,86 @@ let build_recursive_env _context env bindings =
   in
   env_ref := env_with_bindings;
   env_with_bindings
+
+let recursive_types_captured_by_closure closure =
+  let add_unique ty captured =
+    if List.exists (fun current -> current.type_id = ty.type_id) captured then
+      captured
+    else ty :: captured
+  in
+  Ident.fold_name
+    (fun _ value captured ->
+      match value with
+      | VTypeDesc ty when resolved_type_is_recursive ty ->
+        add_unique ty captured
+      | _ -> captured)
+    !(closure.env) []
+
+let recursive_runtime_key ~loc closure =
+  match (closure.closure_name, recursive_types_captured_by_closure closure) with
+  | Some closure_name, [ty] -> Some ((closure_name, ty.type_id), closure_name)
+  | Some _, [] -> None
+  | Some closure_name, _ ->
+    errorf ~loc
+      "Recursive comptime staging for `%s` currently supports one recursive \
+       reflected type descriptor per specialization"
+      closure_name
+  | None, _ -> None
+
+let recursive_runtime_call ~loc context runtime_name args =
+  let arg_exprs = List.map (runtime_expr_of_value ~loc context) args in
+  VCode
+    (Exp.apply
+       (Exp.ident (Location.mknoloc (Longident.Lident runtime_name)))
+       (List.map (fun expr -> (Nolabel, expr)) arg_exprs))
+
+let recursive_runtime_helper_expr ~loc context closure key helper_name =
+  let helper_context =
+    {
+      context with
+      recursive_runtime_apps = Hashtbl.copy context.recursive_runtime_apps;
+    }
+  in
+  Hashtbl.replace helper_context.recursive_runtime_apps key helper_name;
+  let runtime_env, pattern = runtime_pattern_bindings closure.pattern in
+  let env =
+    Ident.fold_name
+      (fun id value env -> Ident.add id value env)
+      runtime_env !(closure.env)
+  in
+  let body_value = stage_expression helper_context env closure.body in
+  context.used_top <- IdentSet.union context.used_top helper_context.used_top;
+  context.cache <-
+    Ident.fold_name
+      (fun id value cache -> Ident.add id value cache)
+      helper_context.cache context.cache;
+  let body =
+    runtime_expr_of_value_with_expected ~loc:closure.body.Ir.loc helper_context
+      closure.body.Ir.typ body_value
+  in
+  Ast_compatible.fun_ ~loc ~arity:(Some 1) pattern body
+
+let recursive_runtime_result ~loc context closure arg =
+  match recursive_runtime_key ~loc closure with
+  | None -> None
+  | Some (key, closure_name) -> (
+    match Hashtbl.find_opt context.recursive_runtime_apps key with
+    | Some helper_name ->
+      Some (recursive_runtime_call ~loc context helper_name [arg])
+    | None ->
+      let helper_name = fresh_comptime_name (closure_name ^ "$rec") in
+      let helper_expr =
+        recursive_runtime_helper_expr ~loc context closure key helper_name
+      in
+      let helper_binding =
+        Vb.mk (Pat.var (Location.mknoloc helper_name)) helper_expr
+      in
+      let helper_call =
+        match recursive_runtime_call ~loc context helper_name [arg] with
+        | VCode call -> call
+        | _ -> assert false
+      in
+      Some (VCode (Exp.let_ Recursive [helper_binding] helper_call)))
 
 let binding_name_from_pattern = function
   | Ir.PVar (id, _) -> Some id
@@ -1483,9 +1632,38 @@ and eval_ident context loc = function
                 "Unknown top-level identifier `%s` during comptime evaluation"
                 name
           in
-          let lowered = Ir.lower_expr context.top_ids binding.source_expr in
-          let value = stage_expression context env lowered in
-          context.cache <- Ident.add id value context.cache;
+          let value =
+            match binding.source_rec_flag with
+            | Recursive -> (
+              let lowered_bindings =
+                List.map
+                  (fun (vb : Typedtree.value_binding) ->
+                    {
+                      Ir.pattern = Ir.lower_pattern vb.vb_pat;
+                      expr = Ir.lower_expr context.top_ids vb.vb_expr;
+                      loc = vb.vb_loc;
+                    })
+                  binding.source_group
+              in
+              let recursive_env =
+                build_recursive_env context Ident.empty lowered_bindings
+              in
+              context.cache <-
+                Ident.fold_name
+                  (fun id value cache -> Ident.add id value cache)
+                  recursive_env context.cache;
+              try Ident.find_same id recursive_env
+              with Not_found ->
+                errorf ~loc
+                  "Unknown recursive top-level identifier `%s` during comptime \
+                   evaluation"
+                  name)
+            | Nonrecursive ->
+              let lowered = Ir.lower_expr context.top_ids binding.source_expr in
+              let value = stage_expression context env lowered in
+              context.cache <- Ident.add id value context.cache;
+              value
+          in
           value))
   | Ir.IGlobal lid -> fun _env -> VCode (Exp.ident lid)
   | Ir.IBuiltin (builtin, runtime_ident) ->
@@ -1541,6 +1719,7 @@ and eval_ident context loc = function
       | Ir.BFieldType ->
         unary (fun _context loc args ->
             match args with
+            | [VFieldDesc field] -> VTypeDesc field.field_type
             | [VVariant (_, Some (VRecord field))] -> (
               match StringMap.find_opt "__type" field with
               | Some value -> value
@@ -1551,6 +1730,7 @@ and eval_ident context loc = function
       | Ir.BFieldName ->
         unary (fun _context loc args ->
             match args with
+            | [VFieldDesc field] -> VString field.field_name
             | [VVariant (_, Some (VRecord field))] -> (
               match StringMap.find_opt "fieldName" field with
               | Some (VString name) -> VString name
@@ -1561,6 +1741,10 @@ and eval_ident context loc = function
       | Ir.BFieldGet ->
         binary (fun _context loc args ->
             match args with
+            | [VFieldDesc field; VCode expr] ->
+              VCode
+                (Exp.field expr
+                   (Location.mknoloc (Longident.Lident field.field_name)))
             | [VVariant (_, Some (VRecord field)); VCode expr] -> (
               match StringMap.find_opt "fieldName" field with
               | Some (VString name) ->
@@ -1582,6 +1766,7 @@ and eval_ident context loc = function
       | Ir.BItemType ->
         unary (fun _context loc args ->
             match args with
+            | [VItemDesc item] -> VTypeDesc item.item_type
             | [VVariant (_, Some (VRecord item))] -> (
               match StringMap.find_opt "__type" item with
               | Some value -> value
@@ -1593,6 +1778,7 @@ and eval_ident context loc = function
       | Ir.BItemIndex ->
         unary (fun _context loc args ->
             match args with
+            | [VItemDesc item] -> VInt item.item_index
             | [VVariant (_, Some (VRecord item))] -> (
               match StringMap.find_opt "itemIndex" item with
               | Some (VInt index) -> VInt index
@@ -1605,6 +1791,10 @@ and eval_ident context loc = function
       | Ir.BItemGet ->
         binary (fun _context loc args ->
             match args with
+            | [VItemDesc item; VCode expr] ->
+              apply context ~loc
+                (tuple_item_get_builtin item.item_index item.item_arity)
+                [VCode expr]
             | [VVariant (_, Some (VRecord item)); VCode expr] -> (
               match StringMap.find_opt "itemGet" item with
               | Some getter -> apply context ~loc getter [VCode expr]
@@ -1618,6 +1808,21 @@ and eval_ident context loc = function
       | Ir.BConstructorPayload ->
         unary (fun _context loc args ->
             match args with
+            | [VConstructorDesc constructor] -> (
+              match constructor.constructor_payload with
+              | Payload_none -> VVariant ("NoPayload", None)
+              | Payload_single inner ->
+                VVariant ("SinglePayload", Some (VTypeDesc inner))
+              | Payload_tuple items ->
+                VVariant
+                  ( "TuplePayload",
+                    Some
+                      (VRecord
+                         (StringMap.empty
+                         |> StringMap.add "items"
+                              (VArray
+                                 (List.map item_value_of_resolved_item items))))
+                  ))
             | [VVariant (_, Some (VRecord constructor))] -> (
               match StringMap.find_opt "__payload" constructor with
               | Some value -> value
@@ -1632,6 +1837,8 @@ and eval_ident context loc = function
       | Ir.BConstructorName ->
         unary (fun _context loc args ->
             match args with
+            | [VConstructorDesc constructor] ->
+              VString constructor.constructor_name
             | [VVariant (_, Some (VRecord constructor))] -> (
               match StringMap.find_opt "constructorName" constructor with
               | Some (VString name) -> VString name
@@ -1645,6 +1852,11 @@ and eval_ident context loc = function
       | Ir.BConstructorUnpack ->
         binary (fun _context loc args ->
             match args with
+            | [VConstructorDesc constructor; value] ->
+              apply context ~loc
+                (constructor_unpack_builtin constructor.constructor_name
+                   constructor.constructor_payload)
+                [value]
             | [VVariant (_, Some (VRecord constructor)); value] -> (
               match StringMap.find_opt "constructorUnpack" constructor with
               | Some unpack -> apply context ~loc unpack [value]
@@ -1659,6 +1871,11 @@ and eval_ident context loc = function
       | Ir.BConstructorMake ->
         binary (fun _context loc args ->
             match args with
+            | [VConstructorDesc constructor; value] ->
+              apply context ~loc
+                (constructor_make_builtin constructor.constructor_name
+                   constructor.constructor_payload)
+                [value]
             | [VVariant (_, Some (VRecord constructor)); value] -> (
               match StringMap.find_opt "constructorMake" constructor with
               | Some make -> apply context ~loc make [value]
@@ -2040,7 +2257,8 @@ and eval context env expr =
   | Ir.ELet (Recursive, bindings, body) ->
     let env = build_recursive_env context env bindings in
     eval context env body
-  | Ir.EFun (pattern, body) -> VClosure {pattern; body; env = ref env}
+  | Ir.EFun (pattern, body) ->
+    VClosure {pattern; body; env = ref env; closure_name = None}
   | Ir.EApply (fn, args) ->
     let fn = eval context env fn in
     let args = List.map (eval context env) args in
@@ -2088,19 +2306,33 @@ and apply context ~loc fn args =
     match args with
     | [] -> fn
     | arg :: rest -> (
-      match match_pattern ~loc closure.pattern arg with
-      | Some bindings ->
-        let closure_context =
-          with_introduced_witnesses context (introduced_witnesses bindings)
-        in
-        let env =
-          Ident.fold_name
-            (fun id value env -> Ident.add id value env)
-            bindings !(closure.env)
-        in
-        let result = stage_expression closure_context env closure.body in
-        if rest = [] then result else apply closure_context ~loc result rest
-      | None -> errorf ~loc "Failed to apply comptime function"))
+      match
+        if value_is_runtime arg then
+          recursive_runtime_result ~loc context closure arg
+        else None
+      with
+      | Some result ->
+        if rest = [] then result else apply context ~loc result rest
+      | None -> (
+        match match_pattern ~loc closure.pattern arg with
+        | Some bindings ->
+          let closure_context =
+            with_introduced_witnesses context (introduced_witnesses bindings)
+          in
+          let env =
+            Ident.fold_name
+              (fun id value env -> Ident.add id value env)
+              bindings !(closure.env)
+          in
+          let result = stage_expression closure_context env closure.body in
+          let result =
+            match result with
+            | VClosure next when next.closure_name = None ->
+              VClosure {next with closure_name = closure.closure_name}
+            | _ -> result
+          in
+          if rest = [] then result else apply closure_context ~loc result rest
+        | None -> errorf ~loc "Failed to apply comptime function")))
   | VCode fn_expr ->
     let arg_exprs = List.map (runtime_expr_of_value ~loc context) args in
     VCode (Exp.apply fn_expr (List.map (fun expr -> (Nolabel, expr)) arg_exprs))
@@ -2179,7 +2411,8 @@ and stage_expression_impl context env expr =
       errorf ~loc:record_expr.Ir.loc
         "Field access in comptime staging expects a reflected record or \
          runtime expression")
-  | Ir.EFun (pattern, body) -> VClosure {pattern; body; env = ref env}
+  | Ir.EFun (pattern, body) ->
+    VClosure {pattern; body; env = ref env; closure_name = None}
   | Ir.ELet (Nonrecursive, bindings, body) ->
     stage_let context env bindings body
   | Ir.ELet (Recursive, bindings, body) ->
@@ -2511,7 +2744,7 @@ let top_bindings_of_typedtree (typedtree : Typedtree.structure) =
   List.fold_left
     (fun tbl (item : Typedtree.structure_item) ->
       match item.str_desc with
-      | Tstr_value (_, bindings) ->
+      | Tstr_value (rec_flag, bindings) ->
         List.fold_left
           (fun tbl (binding : Typedtree.value_binding) ->
             match Typecore.id_of_pattern binding.vb_pat with
@@ -2521,6 +2754,8 @@ let top_bindings_of_typedtree (typedtree : Typedtree.structure) =
                   source_name = Ident.name id;
                   source_expr = binding.vb_expr;
                   source_loc = binding.vb_loc;
+                  source_rec_flag = rec_flag;
+                  source_group = bindings;
                 }
                 tbl
             | None -> tbl)
@@ -2540,6 +2775,7 @@ let context_of_typedtree ~typedtree ~target_type =
       target_type;
       active_types = [];
       type_env = typedtree.str_final_env;
+      recursive_runtime_apps = Hashtbl.create 8;
     } )
 
 let marker_payload_of_typedtree ~(typedtree : Typedtree.structure) ~marker_name

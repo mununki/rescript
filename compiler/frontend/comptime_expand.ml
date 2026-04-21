@@ -23,6 +23,17 @@ let marker_binding marker_name expr =
   Str.value Nonrecursive
     [Vb.mk (Pat.var (Location.mknoloc marker_name)) (comptime_marker_expr expr)]
 
+let has_comptime_module_item (item : structure_item) =
+  match item.pstr_desc with
+  | Pstr_module {pmb_name = {txt = "Comptime"; _}; _}
+  | Pstr_recmodule ({pmb_name = {txt = "Comptime"; _}; _} :: _) ->
+    true
+  | _ -> false
+
+let ensure_comptime_surface prefix =
+  if List.exists has_comptime_module_item prefix then prefix
+  else Comptime_surface.comptime_surface_items () @ prefix
+
 let fresh_marker =
   let counter = ref 0 in
   fun type_name ->
@@ -56,6 +67,7 @@ let rewritten_type_item ~initial_env prefix item =
         Comptime_surface.rewrite_type_generator_expr payload_expr
       in
       let synthetic = marker_binding marker_name payload_expr in
+      let prefix = ensure_comptime_surface prefix in
       let typedtree, _, _ =
         Warnings.without_warnings (fun () ->
             Typemod.type_structure initial_env (prefix @ [synthetic])

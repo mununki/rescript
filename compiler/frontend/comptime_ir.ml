@@ -68,7 +68,7 @@ type pattern =
   | PConstant of Parsetree.constant
   | PTuple of pattern list
   | PRecord of (string * pattern) list
-  | PConstruct of string * pattern list
+  | PConstruct of Longident.t loc * string * pattern list
 
 type expr = {desc: expr_desc; loc: Location.t; typ: Types.type_expr; env: Env.t}
 
@@ -236,8 +236,8 @@ let rec lower_pattern pat =
          (fun (lid, _label, pat, _optional) ->
            (longident_last lid.txt, lower_pattern pat))
          fields)
-  | Tpat_construct (_lid, cstr, pats) ->
-    PConstruct (cstr.cstr_name, List.map lower_pattern pats)
+  | Tpat_construct (lid, cstr, pats) ->
+    PConstruct (lid, cstr.cstr_name, List.map lower_pattern pats)
   | _ ->
     Location.raise_errorf ~loc:pat.pat_loc
       "Unsupported pattern in typed comptime lowering"
