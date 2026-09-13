@@ -27,5 +27,11 @@ val ast_intf_magic_number : string
 val ast_impl_magic_number : string
 
 (* Magic number for file holding an implementation syntax tree *)
+val ppx_v1_intf_magic_number : string
+
+(* Magic number for a V1 PPX interface syntax tree *)
+val ppx_v1_impl_magic_number : string
+
+(* Magic number for a V1 PPX implementation syntax tree *)
 val cmt_magic_number : string
 (* Magic number for compiled interface files *)

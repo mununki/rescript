@@ -233,9 +233,13 @@ let command_line_flags : (string * Bsc_args.spec * string) array =
       unit_call (fun _ -> Clflags.assume_no_mli := Mli_exists),
       "*internal* Assume mli always exist " );
     ( "-ppx",
-      string_list_add Clflags.all_ppx,
+      string_call (Clflags.add_ppx V0),
       "*internal* <command>  Pipe abstract syntax trees through preprocessor \
        <command>" );
+    ( "-rescript-ppx",
+      string_call (Clflags.add_ppx V1),
+      "*internal* <command>  Pipe native ReScript abstract syntax trees \
+       through preprocessor <command>" );
     ( "-open",
       string_list_add Clflags.open_modules,
       "*internal* <module>  Opens the module <module> before typing" );

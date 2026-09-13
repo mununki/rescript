@@ -293,6 +293,8 @@ pub struct Config {
     bs_dev_dependencies: Option<Vec<String>>,
     #[serde(rename = "ppx-flags")]
     pub ppx_flags: Option<Vec<OneOrMore<String>>>,
+    #[serde(rename = "rescript-ppx-flags")]
+    pub rescript_ppx_flags: Option<Vec<OneOrMore<String>>>,
 
     #[serde(rename = "compiler-flags")]
     pub compiler_flags: Option<Vec<OneOrMore<String>>>,
@@ -361,6 +363,7 @@ pub fn flatten_ppx_flags(
     project_context: &ProjectContext,
     package_config: &Config,
     flags: &Option<Vec<OneOrMore<String>>>,
+    compiler_flag: &str,
 ) -> Result<Vec<String>> {
     match flags {
         None => Ok(vec![]),
@@ -377,11 +380,11 @@ pub fn flatten_ppx_flags(
                             )
                             .map(|p| p.to_string_lossy().to_string())?;
 
-                            acc.push(String::from("-ppx"));
+                            acc.push(String::from(compiler_flag));
                             acc.push(path);
                         }
                         _ => {
-                            acc.push(String::from("-ppx"));
+                            acc.push(String::from(compiler_flag));
                             let path = helpers::try_package_path(package_config, project_context, y)
                                 .map(|p| p.to_string_lossy().to_string())?;
                             acc.push(path);
@@ -401,7 +404,7 @@ pub fn flatten_ppx_flags(
                         _ => helpers::try_package_path(package_config, project_context, &ys[0])
                             .map(|p| p.to_string_lossy().to_string())?,
                     };
-                    acc.push(String::from("-ppx"));
+                    acc.push(String::from(compiler_flag));
                     acc.push(
                         vec![ppx]
                             .into_iter()
@@ -806,6 +809,7 @@ pub mod tests {
             bs_dependencies: None,
             bs_dev_dependencies: None,
             ppx_flags: None,
+            rescript_ppx_flags: None,
             compiler_flags: None,
             bsc_flags: None,
             namespace: None,
@@ -841,6 +845,31 @@ pub mod tests {
         let spec = specs.first().unwrap();
         assert_eq!(spec.module, "es6");
         assert_eq!(config.get_suffix(spec), ".mjs");
+    }
+
+    #[test]
+    fn test_rescript_ppx_flags() {
+        let json = r#"
+        {
+            "name": "direct-ppx",
+            "sources": ["src"],
+            "ppx-flags": ["./legacy-ppx"],
+            "rescript-ppx-flags": ["./ppx", ["./ppx-with-arg", "--flag"]]
+        }
+        "#;
+
+        let config = serde_json::from_str::<Config>(json).unwrap();
+        match config.ppx_flags.unwrap().as_slice() {
+            [OneOrMore::Single(command)] => assert_eq!(command, "./legacy-ppx"),
+            _ => panic!("Expected the legacy PPX flag form"),
+        }
+        match config.rescript_ppx_flags.unwrap().as_slice() {
+            [OneOrMore::Single(command), OneOrMore::Multiple(command_with_args)] => {
+                assert_eq!(command, "./ppx");
+                assert_eq!(command_with_args, &["./ppx-with-arg", "--flag"]);
+            }
+            _ => panic!("Expected both ReScript PPX flag forms"),
+        }
     }
 
     #[test]

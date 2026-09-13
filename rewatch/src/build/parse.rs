@@ -288,6 +288,13 @@ pub fn parser_args(
         project_context,
         package_config,
         &filter_ppx_flags(&package_config.ppx_flags, contents),
+        "-ppx",
+    )?;
+    let rescript_ppx_flags = config::flatten_ppx_flags(
+        project_context,
+        package_config,
+        &filter_ppx_flags(&package_config.rescript_ppx_flags, contents),
+        "-rescript-ppx",
     )?;
     let jsx_args = root_config.get_jsx_args();
     let jsx_module_args = root_config.get_jsx_module_args();
@@ -303,6 +310,7 @@ pub fn parser_args(
         ast_path.to_owned(),
         [
             ppx_flags,
+            rescript_ppx_flags,
             jsx_args,
             jsx_module_args,
             jsx_mode_args,

@@ -1,3 +1,7 @@
+type ppx_ast_version = V0 | V1
+
+type ppx = {ast_version: ppx_ast_version; command: string}
+
 val output_name : string option ref
 val include_dirs : string list ref
 
@@ -7,7 +11,8 @@ val fast : bool ref
 val nopervasives : bool ref
 val open_modules : string list ref
 val preprocessor : string option ref
-val all_ppx : string list ref
+val all_ppx : ppx list ref
+val add_ppx : ppx_ast_version -> string -> unit
 val annotations : bool ref
 val binary_annotations : bool ref
 val noassert : bool ref

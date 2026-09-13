@@ -1,3 +1,7 @@
+type ppx_ast_version = V0 | V1
+
+type ppx = {ast_version: ppx_ast_version; command: string}
+
 let output_name = ref (None : string option) (* -o *)
 
 and include_dirs = ref ([] : string list) (* -I *)
@@ -10,9 +14,11 @@ and nopervasives = ref false (* -nopervasives *)
 
 and preprocessor = ref (None : string option) (* -pp *)
 
-and all_ppx = ref ([] : string list)
+and all_ppx = ref ([] : ppx list)
 
 (* -ppx *)
+let add_ppx ast_version command = all_ppx := {ast_version; command} :: !all_ppx
+
 let annotations = ref false (* -annot *)
 let binary_annotations = ref false (* -annot *)
 

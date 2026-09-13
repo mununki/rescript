@@ -52,6 +52,12 @@ let ast0_to_signature : ast0 -> Parsetree.signature = function
     Ast_mapper_from0.default_mapper.signature Ast_mapper_from0.default_mapper
       sig0
 
+let ast0_to_ast : type a. a kind -> ast0 -> a =
+ fun kind ast ->
+  match kind with
+  | Ml -> ast0_to_structure ast
+  | Mli -> ast0_to_signature ast
+
 let ast0_roundtrip : type a. a kind -> a -> a =
  fun kind ast ->
   match kind with
